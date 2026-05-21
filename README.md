@@ -1,3 +1,7 @@
+A full rundown of the Model architecture:
+https://drive.google.com/file/d/1HzfLKIaWbUjhTdrdjHyJhebhZrX9s_IV/view?usp=sharing
+
+
 AIPP simulation running scripts + Diffusion model scripts for training and sampling. 
 Diffusion model can be found in ./Diffusion/SparseDiffusion.py. Training params are all in the head of the file.
 
