@@ -585,6 +585,16 @@ model = NoisePredictor().to(device)
 optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
 
+def remap_legacy_state_dict_keys(state_dict):
+    remapped = {}
+    old_prefix = "mean_var_cnn."
+    new_prefix = "mean_var_marker_cnn."
+    for key, value in state_dict.items():
+        if key.startswith(old_prefix):
+            key = new_prefix + key[len(old_prefix):]
+        remapped[key] = value
+    return remapped
+
 
 
 def get_loss(model, x_0, t, meanvarmarker_map, current_position, weights, alpha=0.1):
@@ -629,12 +639,16 @@ def get_loss(model, x_0, t, meanvarmarker_map, current_position, weights, alpha=
 
 
 @torch.no_grad()
-def ddim_sample_timestep(x, t, t_prev, meanvar_map, current_position, clip_x0=False):
+def ddim_sample_timestep(x, t, t_prev, meanvarmarker_map, current_position, clip_x0=False):
+    if meanvarmarker_map.shape[1] != 3:
+        raise ValueError(
+            f"Expected meanvarmarker_map with 3 channels, got {tuple(meanvarmarker_map.shape)}"
+        )
     alpha_bar_t = get_index_from_list(alphas_cumprod, t, x.shape)
     sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
     sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alpha_bar_t)
 
-    noise_pred = model(x, t, meanvar_map, current_position)
+    noise_pred = model(x, t, meanvarmarker_map, current_position)
     x0_pred = (x - sqrt_one_minus_alpha_bar_t * noise_pred) / sqrt_alpha_bar_t
     if clip_x0:
         x0_pred = x0_pred.clamp(-1.0, 1.0)
@@ -650,7 +664,11 @@ def ddim_sample_timestep(x, t, t_prev, meanvar_map, current_position, clip_x0=Fa
     return x_prev
 
 @torch.no_grad()
-def ddim_sample(initial_noise, meanvar_map, current_position, num_steps=None, clip_x0=False):
+def ddim_sample(initial_noise, meanvarmarker_map, current_position, num_steps=None, clip_x0=False):
+    if meanvarmarker_map.shape[1] != 3:
+        raise ValueError(
+            f"Expected meanvarmarker_map with 3 channels, got {tuple(meanvarmarker_map.shape)}"
+        )
     x = initial_noise
     if num_steps is None or num_steps >= T:
         schedule = list(range(T - 1, -1, -1))
@@ -661,7 +679,7 @@ def ddim_sample(initial_noise, meanvar_map, current_position, num_steps=None, cl
         prev_i = schedule[step_idx + 1] if step_idx + 1 < len(schedule) else -1
         t = torch.full((x.shape[0],), i, dtype=torch.long, device=x.device)
         t_prev = torch.full((x.shape[0],), prev_i, dtype=torch.long, device=x.device)
-        x = ddim_sample_timestep(x, t, t_prev, meanvar_map, current_position, clip_x0=clip_x0)
+        x = ddim_sample_timestep(x, t, t_prev, meanvarmarker_map, current_position, clip_x0=clip_x0)
     return x
 
 

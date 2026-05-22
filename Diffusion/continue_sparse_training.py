@@ -52,17 +52,25 @@ def resolve_checkpoint_path(path_text):
     raise FileNotFoundError(f"Could not find checkpoint: {path_text}")
 
 
-def load_checkpoint(model, optimizer, checkpoint_path):
+def configure_optimizer_param_groups(optimizer, lr, weight_decay):
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+        param_group["weight_decay"] = weight_decay
+
+
+def load_checkpoint(model, optimizer, checkpoint_path, reset_optimizer=False):
     checkpoint = torch.load(checkpoint_path, map_location=diffusion.device)
 
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"])
-        if "optimizer_state_dict" in checkpoint:
+        model.load_state_dict(diffusion.remap_legacy_state_dict_keys(checkpoint["model_state_dict"]))
+        if "optimizer_state_dict" in checkpoint and not reset_optimizer:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        elif reset_optimizer:
+            print("Resetting optimizer state; only model weights were loaded.", flush=True)
         start_epoch = int(checkpoint.get("epoch", 0))
         previous_loss = checkpoint.get("loss")
     else:
-        model.load_state_dict(checkpoint)
+        model.load_state_dict(diffusion.remap_legacy_state_dict_keys(checkpoint))
         start_epoch = 0
         previous_loss = None
         print("Loaded model weights only; optimizer state and epoch were not present.")
@@ -75,11 +83,19 @@ def train_from_checkpoint(
     target_epochs,
     batch_size,
     lr,
+    weight_decay,
     save_every,
+    reset_optimizer,
 ):
     model = diffusion.NoisePredictor().to(diffusion.device)
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.0)
-    start_epoch, previous_loss = load_checkpoint(model, optimizer, checkpoint_path)
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    start_epoch, previous_loss = load_checkpoint(
+        model,
+        optimizer,
+        checkpoint_path,
+        reset_optimizer=reset_optimizer,
+    )
+    configure_optimizer_param_groups(optimizer, lr=lr, weight_decay=weight_decay)
     diffusion.model = model
 
     if target_epochs <= start_epoch:
@@ -101,6 +117,9 @@ def train_from_checkpoint(
         print(f"Checkpoint loss: {previous_loss}", flush=True)
     print(f"Continuing to epoch: {target_epochs}", flush=True)
     print(f"Using device: {diffusion.device}", flush=True)
+    print(f"Using lr: {lr}", flush=True)
+    print(f"Using weight_decay: {weight_decay}", flush=True)
+    print(f"Reset optimizer: {reset_optimizer}", flush=True)
 
     model.train()
     loss_vals = []
@@ -185,7 +204,13 @@ def parse_args():
     )
     parser.add_argument("--batch-size", type=int, default=diffusion.BATCH_SIZE)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=diffusion.WEIGHT_DECAY)
     parser.add_argument("--save-every", type=int, default=10)
+    parser.add_argument(
+        "--reset-optimizer",
+        action="store_true",
+        help="Load model weights from the checkpoint but start a fresh AdamW optimizer.",
+    )
     return parser.parse_args()
 
 
@@ -196,5 +221,7 @@ if __name__ == "__main__":
         target_epochs=args.target_epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        weight_decay=args.weight_decay,
         save_every=args.save_every,
+        reset_optimizer=args.reset_optimizer,
     )

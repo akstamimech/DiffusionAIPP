@@ -12,10 +12,10 @@ from SparseDiffusion import pytorch_cubic_spline
 DEFAULT_CHECKPOINT = (
     Path(__file__).resolve().parent
     / "checkpoints"
-    / "sparse_waypoints_epoch_8000.pth"
+    / "sparse_waypoints_epoch_2400.pth"
 )
-CONDITION_INDEX = 11
-TRUTH_INDEX = 11
+CONDITION_INDEX = 55
+TRUTH_INDEX = 55
 SEED = None
 PLOT_DIR = Path(__file__).resolve().parent / "plots"
 OUTPUT_PATH = PLOT_DIR / "sparse_sample.png"
@@ -31,6 +31,7 @@ def load_model(checkpoint_path, device):
         if isinstance(payload, dict) and "model_state_dict" in payload
         else payload
     )
+    state_dict = diffusion.remap_legacy_state_dict_keys(state_dict)
     model.load_state_dict(state_dict)
     model.eval()
     diffusion.model = model
@@ -44,12 +45,12 @@ def sample_sparse(model, condition_index=0, seed=None, num_steps=None, clip_x0=F
 
     device = diffusion.device
     initial_noise = torch.randn((1, *diffusion.TARGET_SHAPE), device=device)
-    meanvar_map = diffusion.meanvarmaps[condition_index:condition_index + 1].to(device)
+    meanvarmarker_map = diffusion.meanvarmarkermaps[condition_index:condition_index + 1].to(device)
     # SparseDiffusion.conditions is already normalized the same way as waypoints.
     current_position = diffusion.conditions[condition_index:condition_index + 1].to(device)
     return diffusion.ddim_sample(
         initial_noise,
-        meanvar_map,
+        meanvarmarker_map,
         current_position,
         num_steps=num_steps,
         clip_x0=clip_x0,
