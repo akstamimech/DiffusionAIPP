@@ -14,8 +14,8 @@ DEFAULT_CHECKPOINT = (
     / "checkpoints"
     / "sparse_waypoints_epoch_2400.pth"
 )
-CONDITION_INDEX = 55
-TRUTH_INDEX = 55
+CONDITION_INDEX = 77
+TRUTH_INDEX = 77
 SEED = None
 PLOT_DIR = Path(__file__).resolve().parent / "plots"
 OUTPUT_PATH = PLOT_DIR / "sparse_sample.png"
