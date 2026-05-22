@@ -58,7 +58,7 @@ Train() runs the loop over all training data that fit in the index range. The fl
 """
 
 EPOCHS = 1000
-BATCH_SIZE = 64
+BATCH_SIZE = 256
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_COORDS = 2
 NUM_CONTROL_WAYPOINTS = 8
@@ -98,7 +98,7 @@ def forward_diffusion_sample(x_0, t):
 
 
 #FORWARD PROCESS HYPERPARAM
-T = 100
+T = 70
 betas = cosine_beta_schedule(timesteps=T)
 alphas = 1.0 - betas
 alphas_cumprod = torch.cumprod(alphas, axis=0)
@@ -186,20 +186,6 @@ else:
     )
 
 trajectories = (trajectories / SCALE_FACTOR) * 2.0 - 1.0
-
-
-
-trajectories = trajectories.to(device)
-conditions = conditions.to(device)
-means = means.to(device)
-vars = vars.to(device)
-rmsedrop = rmsedrop.to(device)
-weights = weights.to(device)
-one_hot_current_positions = one_hot_current_positions.to(device)
-
-
-
-
 
 def denormalize_control_waypoints(waypoints):
     return ((waypoints + 1.0) / 2.0) * SCALE_FACTOR
@@ -603,7 +589,13 @@ optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
 def get_loss(model, x_0, t, meanvarmarker_map, current_position, weights, alpha=0.1):
     waypoints_noisy, noise = forward_diffusion_sample(x_0, t) 
-    noise_pred = model(waypoints_noisy, t, meanvarmarker_map, current_position)
+    with torch.autocast(
+        device_type="cuda",
+        dtype=torch.bfloat16,
+        enabled=waypoints_noisy.is_cuda,
+    ):
+        noise_pred = model(waypoints_noisy, t, meanvarmarker_map, current_position)
+    noise_pred = noise_pred.float()
 
     waypoint_loss = (noise_pred - noise).pow(2).mean(dim=[1, 2])
 
@@ -848,4 +840,4 @@ if __name__ == "__main__":
     print("control_waypoints shape:", control_waypoints.shape, flush=True)
 
     
-print("test")
+

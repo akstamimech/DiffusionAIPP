@@ -1,7 +1,9 @@
 import argparse
+import os
 from pathlib import Path
 
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -14,6 +16,24 @@ import SparseDiffusion as diffusion
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def make_dataloader(dataset, batch_size):
+    requested_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", "0"))
+    if requested_workers <= 0:
+        requested_workers = 2 if torch.cuda.is_available() else 0
+    num_workers = min(requested_workers, 4) if torch.cuda.is_available() else 0
+
+    kwargs = {
+        "batch_size": batch_size,
+        "shuffle": True,
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = True
+
+    return DataLoader(dataset, **kwargs)
 
 
 def resolve_checkpoint_path(path_text):
@@ -70,10 +90,10 @@ def train_from_checkpoint(
     dataset = diffusion.TrajectoryDataset(
         diffusion.trajectories,
         diffusion.weights,
-        diffusion.meanvarmaps,
+        diffusion.meanvarmarkermaps,
         diffusion.conditions,
     )
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataloader = make_dataloader(dataset, batch_size)
 
     print(f"Loaded checkpoint: {checkpoint_path}", flush=True)
     print(f"Checkpoint epoch: {start_epoch}", flush=True)
@@ -88,18 +108,19 @@ def train_from_checkpoint(
     for epoch in range(start_epoch, target_epochs):
         print(f"Epoch {epoch + 1}/{target_epochs}", flush=True)
         for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
-            traj, current_position, meanvar_map, batch_weights = batch
-            traj = traj.to(diffusion.device)
-            current_position = current_position.to(diffusion.device)
-            meanvar_map = meanvar_map.to(diffusion.device)
-            batch_weights = batch_weights.to(diffusion.device)
+            traj, current_position, meanvarmarker_map, batch_weights = batch
+            model_device = next(model.parameters()).device
+            traj = traj.to(model_device, non_blocking=True)
+            current_position = current_position.to(model_device, non_blocking=True)
+            meanvarmarker_map = meanvarmarker_map.to(model_device, non_blocking=True)
+            batch_weights = batch_weights.to(model_device, non_blocking=True)
 
             t = torch.randint(0, diffusion.T, (traj.shape[0],), device=traj.device).long()
             loss = diffusion.get_loss(
                 model,
                 traj,
                 t,
-                meanvar_map,
+                meanvarmarker_map,
                 current_position,
                 weights=batch_weights,
             )
@@ -127,8 +148,15 @@ def train_from_checkpoint(
 
     if loss_vals:
         loss_plot_path = diffusion.PLOT_DIR / f"sparse_continue_loss_epoch_{target_epochs}.png"
+        window = min(200, len(loss_vals))
         plt.figure()
-        plt.plot(loss_vals, label="Continued training loss")
+        if window > 1:
+            kernel = np.ones(window, dtype=np.float32) / window
+            moving_avg = np.convolve(np.asarray(loss_vals, dtype=np.float32), kernel, mode="valid")
+            plt.plot(loss_vals, alpha=0.18, label="Raw continued training loss")
+            plt.plot(range(window - 1, len(loss_vals)), moving_avg, label=f"{window}-step moving average")
+        else:
+            plt.plot(loss_vals, label="Continued training loss")
         plt.xlabel("Step")
         plt.ylabel("Loss")
         plt.title("Sparse diffusion continued training loss")
