@@ -799,7 +799,7 @@ def train(
     epochs,
     betas=betas,
     lr=1e-3,
-    save_every=10,
+    save_every=100,
     val_dataloader=None,
 ):
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.0)
