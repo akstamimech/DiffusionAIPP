@@ -16,3 +16,4 @@ csv/
 .env
 .venv/
 .DS_Store
+Diffusion/old/
