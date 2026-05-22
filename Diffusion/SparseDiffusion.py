@@ -57,7 +57,7 @@ Train() runs the loop over all training data that fit in the index range. The fl
 - control waypoints are normalized to [-1, 1]
 """
 
-EPOCHS = 1000
+EPOCHS = 3
 BATCH_SIZE = 256
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_COORDS = 2
@@ -395,16 +395,16 @@ def pytorch_cubic_spline(control_waypoints, current_position, samples_per_segmen
 
 # The conditioning channels have very different scales. Standardizing the mean
 # map and log-variance map makes optimization much easier for the MLP.
-log_vars = torch.log1p(vars)
+# log_vars = torch.log1p(vars)
 mean_center = means.mean()
 mean_scale = means.std().clamp_min(1e-6)
-log_var_center = log_vars.mean()
-log_var_scale = log_vars.std().clamp_min(1e-6)
+var_center = vars.mean()
+var_scale = vars.std().clamp_min(1e-6)
 
 means = (means - mean_center) / mean_scale
-log_vars = (log_vars - log_var_center) / log_var_scale
-meanvarmaps = torch.stack([means, log_vars], dim=1)  # shape (B, 2, 51, 51)
-meanvarmarkermaps = torch.stack([means, log_vars, one_hot_current_positions.squeeze(1)], dim=1)  # shape (B, 3, 51, 51)
+vars = (vars - var_center) / var_scale
+meanvarmaps = torch.stack([means, vars], dim=1)  # shape (B, 2, 51, 51)
+meanvarmarkermaps = torch.stack([means, vars, one_hot_current_positions.squeeze(1)], dim=1)  # shape (B, 3, 51, 51)
 
 
 if INDEX is not None and INDEX > 0:
@@ -415,6 +415,8 @@ if INDEX is not None and INDEX > 0:
     rmsedrop = rmsedrop[:INDEX]
     weights = weights[:INDEX]
     meanvarmarkermaps = meanvarmarkermaps[:INDEX]
+    map_ids = map_ids[:INDEX]
+    timesteps = timesteps[:INDEX]
 
 
 class TrajectoryDataset(Dataset):
@@ -432,6 +434,18 @@ class TrajectoryDataset(Dataset):
         if self.conditions is None:
             return self.trajectories[idx]
         return self.trajectories[idx], self.conditions[idx], self.meanvarmarkermaps[idx], self.weights[idx]
+
+
+def build_map_id_split(val_count=2):
+    unique_map_ids = torch.unique(map_ids).sort().values
+    if unique_map_ids.numel() <= val_count:
+        raise ValueError(
+            f"Need more than {val_count} map_ids to build a validation split, got {unique_map_ids.tolist()}"
+        )
+    val_map_ids = unique_map_ids[-val_count:]
+    val_mask = torch.isin(map_ids, val_map_ids)
+    train_mask = ~val_mask
+    return train_mask, val_mask, val_map_ids
 
 
 class SinusoidalPositionEmbeddings(nn.Module):
@@ -752,11 +766,48 @@ def train_one_sample(model, steps=3000, batch_size=64):
     return losses
 
 
-def train(model, dataloader, epochs, betas=betas, lr=1e-3, save_every=10):
+@torch.no_grad()
+def evaluate(model, dataloader):
+    was_training = model.training
+    model.eval()
+    total_loss = 0.0
+    total_batches = 0
+    model_device = next(model.parameters()).device
+
+    for batch in dataloader:
+        traj, current_position, meanvarmarker_map, batch_weights = batch
+        traj = traj.to(model_device, non_blocking=True)
+        current_position = current_position.to(model_device, non_blocking=True)
+        meanvarmarker_map = meanvarmarker_map.to(model_device, non_blocking=True)
+        batch_weights = batch_weights.to(model_device, non_blocking=True)
+        t = torch.randint(0, T, (traj.shape[0],), device=traj.device).long()
+        loss = get_loss(model, traj, t, meanvarmarker_map, current_position, weights=batch_weights)
+        total_loss += loss.item()
+        total_batches += 1
+
+    if was_training:
+        model.train()
+
+    if total_batches == 0:
+        return float("nan")
+    return total_loss / total_batches
+
+
+def train(
+    model,
+    dataloader,
+    epochs,
+    betas=betas,
+    lr=1e-3,
+    save_every=10,
+    val_dataloader=None,
+):
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.0)
     model.train()
     loss_vals = []
     stepcount = []
+    val_loss_vals = []
+    val_steps = []
 
     for epoch in range(epochs):
         print(f"Epoch {epoch + 1}/{epochs}")
@@ -791,6 +842,12 @@ def train(model, dataloader, epochs, betas=betas, lr=1e-3, save_every=10):
             torch.save(checkpoint, checkpoint_path)
             print(f"Checkpoint saved: {checkpoint_path}")
 
+        if val_dataloader is not None:
+            val_loss = evaluate(model, val_dataloader)
+            val_loss_vals.append(val_loss)
+            val_steps.append((epoch + 1) * len(dataloader))
+            print(f"Epoch {epoch + 1} held-out validation loss: {val_loss:.6f}", flush=True)
+
         print(f"Epoch {epoch + 1} complete, lr={lr:.6f}", flush=True)
     
     window = min(200, len(loss_vals))
@@ -811,6 +868,23 @@ def train(model, dataloader, epochs, betas=betas, lr=1e-3, save_every=10):
     plt.savefig(loss_plot_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Saved training loss plot to {loss_plot_path}")
+
+    if val_loss_vals:
+        plt.figure()
+        plt.plot(
+            val_steps,
+            val_loss_vals,
+            marker="o",
+            label="Held-Out Validation Loss",
+        )
+        plt.xlabel("Training Step")
+        plt.ylabel("Loss")
+        plt.title("Sparse Diffusion Held-Out Validation Loss")
+        plt.legend()
+        val_loss_plot_path = PLOT_DIR / "sparse_validation_loss.png"
+        plt.savefig(val_loss_plot_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"Saved validation loss plot to {val_loss_plot_path}")
 
     sample_plot_traj(PLOT_DIR / "sparse_training_sample.png")
 
@@ -837,20 +911,33 @@ if __name__ == "__main__":
     if dataloader_kwargs["num_workers"] > 0:
         dataloader_kwargs["persistent_workers"] = True
 
+    train_mask, val_mask, val_map_ids = build_map_id_split(val_count=2)
+    print(f"Validation map_ids: {val_map_ids.tolist()}", flush=True)
+    print(f"Training samples: {int(train_mask.sum().item())}", flush=True)
+    print(f"Validation samples: {int(val_mask.sum().item())}", flush=True)
+
+    train_dataset = TrajectoryDataset(
+        trajectories[train_mask],
+        weights[train_mask],
+        meanvarmarkermaps=meanvarmarkermaps[train_mask],
+        conditions=conditions[train_mask],
+    )
+    val_dataset = TrajectoryDataset(
+        trajectories[val_mask],
+        weights[val_mask],
+        meanvarmarkermaps=meanvarmarkermaps[val_mask],
+        conditions=conditions[val_mask],
+    )
+    val_dataloader_kwargs = dict(dataloader_kwargs)
+    val_dataloader_kwargs["shuffle"] = False
+
     print("Starting training loop", flush=True)
 
     train(
         model,
-        DataLoader(
-            TrajectoryDataset(
-                trajectories,
-                weights,
-                meanvarmarkermaps=meanvarmarkermaps,
-                conditions=conditions,
-            ),
-            **dataloader_kwargs,
-        ),
+        DataLoader(train_dataset, **dataloader_kwargs),
         epochs=EPOCHS,
+        val_dataloader=DataLoader(val_dataset, **val_dataloader_kwargs),
     )
 
     print("Done training", flush=True)
