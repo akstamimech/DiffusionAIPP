@@ -37,7 +37,7 @@ The reverse sampling process starts from pure np.random noise, and iteratively d
 Hyperparams that affect training and sampling are defined at the top of the file: 
 EPOCHS, BATCH_SIZE, LR, and INDEX (for debugging with a smaller subset of the data).
 
-Conditioning and Model details details:
+Conditioning and Model details:
 MeanVarMarkerCNN takes in a 3-channel map of shape (B, 3, 51, 51) [batch, map data, x, y], where the 3 channels are: Mean map, Variance map, and a one-hot marker for the current position.
 The CNN processes this map to extract spatial features that help the model understand the environment and how it relates to the control waypoints.
 
@@ -57,7 +57,7 @@ Train() runs the loop over all training data that fit in the index range. The fl
 - control waypoints are normalized to [-1, 1]
 """
 
-EPOCHS = 12
+EPOCHS = 1000
 BATCH_SIZE = 64
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_COORDS = 2
@@ -98,7 +98,7 @@ def forward_diffusion_sample(x_0, t):
 
 
 #FORWARD PROCESS HYPERPARAM
-T = 200
+T = 100
 betas = cosine_beta_schedule(timesteps=T)
 alphas = 1.0 - betas
 alphas_cumprod = torch.cumprod(alphas, axis=0)
@@ -195,6 +195,7 @@ means = means.to(device)
 vars = vars.to(device)
 rmsedrop = rmsedrop.to(device)
 weights = weights.to(device)
+one_hot_current_positions = one_hot_current_positions.to(device)
 
 
 
@@ -752,9 +753,11 @@ def train(model, dataloader, epochs, betas=betas, lr=1e-3, save_every=10):
         for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             stepcount.append(epoch * len(dataloader) + step)
             traj, current_position, meanvarmarker_map, batch_weights = batch
-            traj = traj.to(next(model.parameters()).device)
-            current_position = current_position.to(next(model.parameters()).device)
-            meanvarmarker_map = meanvarmarker_map.to(next(model.parameters()).device)
+            model_device = next(model.parameters()).device
+            traj = traj.to(model_device, non_blocking=True)
+            current_position = current_position.to(model_device, non_blocking=True)
+            meanvarmarker_map = meanvarmarker_map.to(model_device, non_blocking=True)
+            batch_weights = batch_weights.to(model_device, non_blocking=True)
             batch_size = traj.shape[0]
             t = torch.randint(0, T, (batch_size,), device=traj.device).long()
             loss = get_loss(model, traj, t, meanvarmarker_map, current_position, weights=batch_weights)
@@ -812,13 +815,37 @@ if __name__ == "__main__":
     print("Building MLP diffusion model", flush=True)
     model = NoisePredictor().to(device)
 
-    print("Training one-sample overfit model", flush=True)
-    #batch_wreights = torch.ones(batch_size, device=device)
+    # print("Training one-sample overfit model", flush=True)
+    #batch_weights = torch.ones(batch_size, device=device)
     # train_one_sample(model, steps=EPOCHS, batch_size=BATCH_SIZE)
-    train(model, DataLoader(TrajectoryDataset(trajectories, weights, meanvarmarkermaps=meanvarmarkermaps, conditions=conditions), batch_size=BATCH_SIZE, shuffle=True), epochs=EPOCHS)
+    dataloader_kwargs = {
+        "batch_size": BATCH_SIZE,
+        "shuffle": True,
+        "num_workers": 4 if torch.cuda.is_available() else 0,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if dataloader_kwargs["num_workers"] > 0:
+        dataloader_kwargs["persistent_workers"] = True
+
+    print("Starting training loop", flush=True)
+
+    train(
+        model,
+        DataLoader(
+            TrajectoryDataset(
+                trajectories,
+                weights,
+                meanvarmarkermaps=meanvarmarkermaps,
+                conditions=conditions,
+            ),
+            **dataloader_kwargs,
+        ),
+        epochs=EPOCHS,
+    )
 
     print("Done training", flush=True)
 
     print("control_waypoints shape:", control_waypoints.shape, flush=True)
 
     
+print("test")
