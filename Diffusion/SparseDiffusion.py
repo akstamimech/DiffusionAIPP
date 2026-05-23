@@ -630,7 +630,8 @@ def get_loss(model, x_0, t, meanvarmarker_map, current_position, weights, alpha=
 
     spline_loss = (traj_noise_pred - traj_noise_true).pow(2).mean(dim=[1, 2])
 
-    per_sample_loss = waypoint_loss + alpha * spline_loss
+    # per_sample_loss = waypoint_loss + alpha * spline_loss
+    per_sample_loss = waypoint_loss
     return (per_sample_loss * weights).sum() / (weights.sum() + 1e-6)
 
 
@@ -770,8 +771,8 @@ def train_one_sample(model, steps=3000, batch_size=64):
 def evaluate(model, dataloader):
     was_training = model.training
     model.eval()
-    total_loss = 0.0
-    total_batches = 0
+    weighted_loss_sum = 0.0
+    total_weight = 0.0
     model_device = next(model.parameters()).device
 
     for batch in dataloader:
@@ -782,15 +783,16 @@ def evaluate(model, dataloader):
         batch_weights = batch_weights.to(model_device, non_blocking=True)
         t = torch.randint(0, T, (traj.shape[0],), device=traj.device).long()
         loss = get_loss(model, traj, t, meanvarmarker_map, current_position, weights=batch_weights)
-        total_loss += loss.item()
-        total_batches += 1
+        batch_weight_sum = batch_weights.sum().item()
+        weighted_loss_sum += loss.item() * batch_weight_sum
+        total_weight += batch_weight_sum
 
     if was_training:
         model.train()
 
-    if total_batches == 0:
+    if total_weight <= 0.0:
         return float("nan")
-    return total_loss / total_batches
+    return weighted_loss_sum / total_weight
 
 
 def train(
