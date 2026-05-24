@@ -59,7 +59,7 @@ Train() runs the loop over all training data that fit in the index range. The fl
 - control waypoints are normalized to [-1, 1]
 """
 
-EPOCHS = 3
+EPOCHS = 1
 BATCH_SIZE = 256
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_COORDS = 2
@@ -112,7 +112,7 @@ posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod
 
 
 data_dict = torch.load(
-    SCRIPT_DIR / "CMAES_beamsearch_dataset.pt"
+    SCRIPT_DIR / "CMAES_currentstack_beamsearch_dataset.pt"
 )
 dense_trajectories = data_dict["trajectories"].float()
 control_waypoints = data_dict["control_waypoints"].float()
@@ -481,6 +481,75 @@ class SpatialSinusoidalPositionEmbeddings2D(nn.Module):
         return embeddings.unsqueeze(0)
 
 
+map_token_set = []
+
+
+def plot_captured_map_tokens(
+    output_path=None,
+    max_sets=4,
+    sample_index=0,
+    channel_indices=(0, 1, 2),
+    seed=0,
+):
+    if not map_token_set:
+        print("No captured map tokens to plot.")
+        return
+
+    rng = np.random.default_rng(seed)
+    num_sets = min(max_sets, len(map_token_set))
+    set_indices = rng.choice(len(map_token_set), size=num_sets, replace=False)
+    channel_indices = tuple(channel_indices)
+    num_cols = 1 + len(channel_indices)
+
+    fig, axes = plt.subplots(
+        num_sets,
+        num_cols,
+        figsize=(3.2 * num_cols, 3.0 * num_sets),
+        squeeze=False,
+    )
+
+    for row, set_idx in enumerate(set_indices):
+        tokens = map_token_set[int(set_idx)]
+        if sample_index >= tokens.shape[0]:
+            raise ValueError(
+                f"sample_index={sample_index} is out of range for captured token batch "
+                f"with size {tokens.shape[0]}"
+            )
+
+        token_grid = tokens[sample_index]
+        grid_side = int(math.sqrt(token_grid.shape[0]))
+        if grid_side * grid_side != token_grid.shape[0]:
+            raise ValueError(f"Expected square token grid, got {token_grid.shape[0]} tokens")
+
+        norm_img = token_grid.norm(dim=-1).reshape(grid_side, grid_side).numpy()
+        ax = axes[row, 0]
+        im = ax.imshow(norm_img, origin="lower", cmap="viridis")
+        ax.set_title(f"set {int(set_idx)}: token norm")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+        for col, channel_idx in enumerate(channel_indices, start=1):
+            if channel_idx >= token_grid.shape[1]:
+                raise ValueError(
+                    f"channel index {channel_idx} is out of range for token dim {token_grid.shape[1]}"
+                )
+            channel_img = token_grid[:, channel_idx].reshape(grid_side, grid_side).numpy()
+            ax = axes[row, col]
+            im = ax.imshow(channel_img, origin="lower", cmap="coolwarm")
+            ax.set_title(f"set {int(set_idx)}: channel {channel_idx}")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    if output_path is None:
+        output_path = PLOT_DIR / "sparse_trans_map_tokens.png"
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved captured map token plot to {output_path}")
     
  
  
@@ -546,6 +615,7 @@ class MeanVarMarkerCNN(nn.Module):
             dtype=map_tokens.dtype,
         ) # add spatial positional embedding to each token
 
+        map_token_set.append(map_tokens.detach().cpu())
 
         return map_tokens
 
@@ -914,10 +984,11 @@ def train_one_sample(model, steps=3000, batch_size=64):
     for step in range(steps):
         traj = x0.repeat(batch_size, 1, 1)
         current_position = pos0.repeat(batch_size, 1)
-        meanvarmarker_map = meanvarmarker_map.repeat(batch_size, 1, 1, 1)
+        batch_meanvarmarker_map = meanvarmarker_map.repeat(batch_size, 1, 1, 1)
+        batch_weights = torch.ones(batch_size, device=device)
 
         t = torch.randint(0, T, (batch_size,), device=device).long()
-        loss = get_loss(model, traj, t, meanvarmarker_map, current_position)
+        loss = get_loss(model, traj, t, batch_meanvarmarker_map, current_position, weights=batch_weights)
         losses.append(loss.item())
 
         optimizer.zero_grad()
@@ -1018,7 +1089,7 @@ def train(
                 "optimizer_state_dict": optimizer.state_dict(),
                 "loss": loss.item(),
             }
-            checkpoint_path = CHECKPOINT_DIR / f"sparse_waypoints_epoch_{epoch + 1}.pth"
+            checkpoint_path = CHECKPOINT_DIR / f"sparse_trans_waypoints_epoch_{epoch + 1}.pth"
             torch.save(checkpoint, checkpoint_path)
             print(f"Checkpoint saved: {checkpoint_path}")
 
@@ -1042,9 +1113,9 @@ def train(
         plt.plot(stepcount, loss_vals, label="Training Loss")
     plt.xlabel("Step")
     plt.ylabel("Loss")
-    plt.title("Sparse Diffusion Training Loss")
+    plt.title("SparseTrans Diffusion Training Loss")
     plt.legend()
-    loss_plot_path = PLOT_DIR / "sparse_training_loss.png"
+    loss_plot_path = PLOT_DIR / "sparse_trans_training_loss.png"
     plt.savefig(loss_plot_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Saved training loss plot to {loss_plot_path}")
@@ -1059,14 +1130,14 @@ def train(
         )
         plt.xlabel("Training Step")
         plt.ylabel("Loss")
-        plt.title("Sparse Diffusion Held-Out Validation Loss")
+        plt.title("SparseTrans Diffusion Held-Out Validation Loss")
         plt.legend()
-        val_loss_plot_path = PLOT_DIR / "sparse_validation_loss.png"
+        val_loss_plot_path = PLOT_DIR / "sparse_trans_validation_loss.png"
         plt.savefig(val_loss_plot_path, dpi=150, bbox_inches="tight")
         plt.close()
         print(f"Saved validation loss plot to {val_loss_plot_path}")
 
-    sample_plot_traj(PLOT_DIR / "sparse_training_sample.png")
+    sample_plot_traj(PLOT_DIR / "sparse_trans_training_sample.png")
 
 
    
@@ -1076,7 +1147,7 @@ if __name__ == "__main__":
     print("Checkpoint directory made", flush=True)
     print("Using device:", device, flush=True)
 
-    print("Building MLP diffusion model", flush=True)
+    print("Building SparseTrans diffusion model", flush=True)
     model = NoisePredictor().to(device)
 
     # print("Training one-sample overfit model", flush=True)
@@ -1123,6 +1194,15 @@ if __name__ == "__main__":
     print("Done training", flush=True)
 
     print("control_waypoints shape:", control_waypoints.shape, flush=True)
+
+   
+# # run model/sample/training batch here so map_token_set gets populated
+
+#     plot_captured_map_tokens(
+#         max_sets=4,
+#         sample_index=0,
+#         channel_indices=(0, 1, 2),
+#     )   
 
     
 
