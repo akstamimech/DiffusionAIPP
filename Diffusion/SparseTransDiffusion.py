@@ -59,7 +59,7 @@ Train() runs the loop over all training data that fit in the index range. The fl
 - control waypoints are normalized to [-1, 1]
 """
 
-EPOCHS = 1
+EPOCHS = 600
 BATCH_SIZE = 256
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_COORDS = 2
@@ -70,7 +70,8 @@ LR = 3e-4
 WEIGHT_DECAY = 1e-4
 GRAD_CLIP_NORM = 1.0
 MIN_LR = 1e-5
-INDEX = -1
+INDEX = 1000
+CAPTURE_MAP_TOKENS = False
 
 
 
@@ -351,53 +352,6 @@ def pytorch_cubic_spline(control_waypoints, current_position, samples_per_segmen
 
 
 
-
-
-# def spline_regeneration(sparse_states_generated, samples_per_segment=5):
-#     """
-#     sparse_states_generated: [2, 9] in world coordinates.
-#         column 0 = current position
-#         columns 1: = 8 control waypoints
-
-#     returns:
-#         dense_path: [2, 41]
-#         dense_actions: [2, 40]
-#     """
-#     waypoints = sparse_states_generated.T  # [9, 2]
-
-#     deltas = np.diff(waypoints, axis=0)
-#     seg_lengths = np.hypot(deltas[:, 0], deltas[:, 1])
-#     t = np.concatenate([[0.0], np.cumsum(seg_lengths)])
-
-#     keep = np.concatenate([[True], np.diff(t) > 1e-9])
-#     waypoints = waypoints[keep]
-#     t = t[keep]
-
-#     if len(t) < 2:
-#         dense_path = np.repeat(waypoints[:1], 41, axis=0)
-#         dense_path = dense_path.T
-#         dense_actions = dense_path[:, 1:] - dense_path[:, :-1]
-#         return dense_path, dense_actions
-
-#     cs_x = CubicSpline(t, waypoints[:, 0], bc_type="natural")
-#     cs_y = CubicSpline(t, waypoints[:, 1], bc_type="natural")
-
-#     trajectory = []
-#     for i in range(len(t) - 1):
-#         t_segment = np.linspace(t[i], t[i + 1], samples_per_segment, endpoint=False)
-#         for ts in t_segment:
-#             trajectory.append((float(cs_x(ts)), float(cs_y(ts))))
-
-#     trajectory.append((float(waypoints[-1, 0]), float(waypoints[-1, 1])))
-
-#     dense_path = np.asarray(trajectory, dtype=np.float32).T  # [2, 41]
-#     dense_actions = dense_path[:, 1:] - dense_path[:, :-1]  # [2, 40]
-
-#     return dense_path, dense_actions
-
-# The conditioning channels have very different scales. Standardizing the mean
-# map and log-variance map makes optimization much easier for the MLP.
-# log_vars = torch.log1p(vars)
 mean_center = means.mean()
 mean_scale = means.std().clamp_min(1e-6)
 var_center = vars.mean()
@@ -569,6 +523,7 @@ class MeanVarMarkerCNN(nn.Module):
 
         """
         input maps: (B, 3, 51, 51) [batch, map data, x, y] (3 channels for mean, var, and marker)
+        output: (B, 144, token_dim) [batch, tokens, token_dim], where 144 = 12*12 is the number of tokens from the map, and token_dim is the dimension of each token embedding.
         """
 
         self.conv1 = nn.Conv2d(in_channels=input_channels, out_channels=hidden_dim, kernel_size=3, padding=1) #(B, 3, 51, 51) -> (B, 64, 51, 51)
@@ -580,6 +535,7 @@ class MeanVarMarkerCNN(nn.Module):
         self.token_proj = nn.Linear(hidden_dim * 2, token_dim) #(B, 144, 128) -> (B, 144, 128)
         self.token_norm = nn.LayerNorm(token_dim)
         self.spatial_embedding = SpatialSinusoidalPositionEmbeddings2D(token_dim)
+        self.final_norm = nn.LayerNorm(token_dim)
 
 
 
@@ -614,8 +570,10 @@ class MeanVarMarkerCNN(nn.Module):
             device=map_tokens.device,
             dtype=map_tokens.dtype,
         ) # add spatial positional embedding to each token
+        map_tokens = self.final_norm(map_tokens)
 
-        map_token_set.append(map_tokens.detach().cpu())
+        if CAPTURE_MAP_TOKENS:
+            map_token_set.append(map_tokens.detach().cpu())
 
         return map_tokens
 
@@ -676,7 +634,7 @@ class WPTokenization(nn.Module):
             nn.Linear(token_dim, token_dim),
             nn.SiLU(),
         )
-        # self.final_norm = nn.LayerNorm(token_dim)
+        self.final_norm = nn.LayerNorm(token_dim)
         self.current_pos_mlp = nn.Sequential(nn.Linear(2, token_dim), nn.SiLU(), nn.Linear(token_dim, token_dim))
 
     def forward(self, x, t, current_position): 
@@ -703,7 +661,7 @@ class WPTokenization(nn.Module):
         waypoint_tokens = waypoint_tokens + time_tokens # add timestep embedding to each waypoint token
         waypoint_tokens = waypoint_tokens + current_pos_tokens # add current position embedding to each waypoint token
 
-        # waypoint_tokens = self.final_norm(waypoint_tokens) # normalize across token_dim for each token
+        waypoint_tokens = self.final_norm(waypoint_tokens) # normalize across token_dim for each token
         
         return waypoint_tokens
 
@@ -785,7 +743,17 @@ class WPMapCrossAttention(nn.Module):
 
 
 
+class SparseTransAttentionBlock(nn.Module):
+    def __init__(self, token_dim, num_heads = 4, mlp_ratio = 4, dropout = 0.0):
+        super().__init__()
+        self.self_attn = WPSelfAttention(token_dim, num_heads, mlp_ratio, dropout)
+        self.cross_attn = WPMapCrossAttention(token_dim, num_heads, mlp_ratio, dropout)
 
+
+    def forward(self, waypoint_tokens, map_tokens):
+        waypoint_tokens = self.self_attn(waypoint_tokens)
+        waypoint_tokens = self.cross_attn(waypoint_tokens, map_tokens)
+        return waypoint_tokens
 
 
 
@@ -822,22 +790,28 @@ class WPMapCrossAttention(nn.Module):
 
 
 class NoisePredictor(nn.Module):
-    def __init__(self, time_emb_dim=64, token_dim=256, base_channels=64):
+    def __init__(self, token_dim=256, base_channels=64, num_blocks=3):
         super().__init__()
         self.mean_var_marker_cnn = MeanVarMarkerCNN(input_channels=3, hidden_dim=base_channels, token_dim=token_dim)
         self.wp_tokenization = WPTokenization(token_dim)
-        self.wpself_attn = WPSelfAttention(token_dim)
-        self.wpmap_cross_attn = WPMapCrossAttention(token_dim)
+        self.attention_blocks = nn.ModuleList(
+            [
+                SparseTransAttentionBlock(token_dim, num_heads=4, mlp_ratio=4, dropout=0.1)
+                for _ in range(num_blocks)
+            ] #remember lol
+        )
 
 
         self.output = nn.Linear(token_dim, 2)
+        # nn.init.normal_(self.output.weight, mean=0.0, std=1e-3)
+        # nn.init.zeros_(self.output.bias)
 
 
     def forward(self, x, t, meanvarmarker_map, current_position=None):
         map_tokens = self.mean_var_marker_cnn(meanvarmarker_map) # [B, 144, token_dim]
         wp_tokens = self.wp_tokenization(x, t, current_position) # [B, 8, token_dim]
-        wp_tokens = self.wpself_attn(wp_tokens) # [B, 8, token_dim]
-        wp_tokens = self.wpmap_cross_attn(wp_tokens, map_tokens) # [B, 8, token_dim]
+        for attention_block in self.attention_blocks:
+            wp_tokens = attention_block(wp_tokens, map_tokens) # [B, 8, token_dim]
         noise_pred = self.output(wp_tokens) # [B, 8, 2]
         return noise_pred.transpose(1, 2) # [B, 2, 8]
         
@@ -1053,15 +1027,20 @@ def train(
     save_every=100,
     val_dataloader=None,
 ):
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.0)
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=MIN_LR)
     model.train()
     loss_vals = []
     stepcount = []
+    epoch_train_loss_vals = []
+    epoch_steps = []
     val_loss_vals = []
     val_steps = []
 
     for epoch in range(epochs):
         print(f"Epoch {epoch + 1}/{epochs}")
+        epoch_loss_sum = 0.0
+        epoch_weight_sum = 0.0
         for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             stepcount.append(epoch * len(dataloader) + step)
             traj, current_position, meanvarmarker_map, batch_weights = batch
@@ -1074,20 +1053,30 @@ def train(
             t = torch.randint(0, T, (batch_size,), device=traj.device).long()
             loss = get_loss(model, traj, t, meanvarmarker_map, current_position, weights=batch_weights)
             loss_vals.append(loss.item())
+            batch_weight_sum = batch_weights.sum().item()
+            epoch_loss_sum += loss.item() * batch_weight_sum
+            epoch_weight_sum += batch_weight_sum
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             optimizer.step()
 
             if step % 100 == 0:
                 print(f"Step {step}, Loss: {loss.item():.4f}", flush=True)
+
+        epoch_train_loss = epoch_loss_sum / max(epoch_weight_sum, 1e-6)
+        epoch_train_loss_vals.append(epoch_train_loss)
+        epoch_steps.append((epoch + 1) * len(dataloader))
 
         if (epoch + 1) % save_every == 0:
             checkpoint = {
                 "epoch": epoch + 1,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "loss": loss.item(),
+                "epoch_train_loss": epoch_train_loss,
             }
             checkpoint_path = CHECKPOINT_DIR / f"sparse_trans_waypoints_epoch_{epoch + 1}.pth"
             torch.save(checkpoint, checkpoint_path)
@@ -1099,7 +1088,12 @@ def train(
             val_steps.append((epoch + 1) * len(dataloader))
             print(f"Epoch {epoch + 1} held-out validation loss: {val_loss:.6f}", flush=True)
 
-        print(f"Epoch {epoch + 1} complete, lr={lr:.6f}", flush=True)
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(
+            f"Epoch {epoch + 1} complete, train_loss={epoch_train_loss:.6f}, lr={current_lr:.6f}",
+            flush=True,
+        )
     
     window = min(200, len(loss_vals))
     plt.figure()
@@ -1119,6 +1113,23 @@ def train(
     plt.savefig(loss_plot_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Saved training loss plot to {loss_plot_path}")
+
+    if epoch_train_loss_vals:
+        plt.figure()
+        plt.plot(
+            epoch_steps,
+            epoch_train_loss_vals,
+            marker="o",
+            label="Epoch-Average Training Loss",
+        )
+        plt.xlabel("Training Step")
+        plt.ylabel("Loss")
+        plt.title("SparseTrans Diffusion Epoch-Average Training Loss")
+        plt.legend()
+        epoch_loss_plot_path = PLOT_DIR / "sparse_trans_epoch_training_loss.png"
+        plt.savefig(epoch_loss_plot_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"Saved epoch training loss plot to {epoch_loss_plot_path}")
 
     if val_loss_vals:
         plt.figure()
