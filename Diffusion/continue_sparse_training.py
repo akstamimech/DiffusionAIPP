@@ -18,7 +18,7 @@ import SparseDiffusion as diffusion
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
-def make_dataloader(dataset, batch_size):
+def make_dataloader(dataset, batch_size, shuffle=True):
     requested_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", "0"))
     if requested_workers <= 0:
         requested_workers = 2 if torch.cuda.is_available() else 0
@@ -26,7 +26,7 @@ def make_dataloader(dataset, batch_size):
 
     kwargs = {
         "batch_size": batch_size,
-        "shuffle": True,
+        "shuffle": shuffle,
         "num_workers": num_workers,
         "pin_memory": torch.cuda.is_available(),
     }
@@ -103,13 +103,25 @@ def train_from_checkpoint(
             f"target_epochs={target_epochs} must be greater than checkpoint epoch {start_epoch}"
         )
 
-    dataset = diffusion.TrajectoryDataset(
-        diffusion.trajectories,
-        diffusion.weights,
-        diffusion.meanvarmarkermaps,
-        diffusion.conditions,
+    train_mask, val_mask, val_map_ids = diffusion.build_map_id_split(val_count=2)
+    print(f"Validation map_ids: {val_map_ids.tolist()}", flush=True)
+    print(f"Training samples: {int(train_mask.sum().item())}", flush=True)
+    print(f"Validation samples: {int(val_mask.sum().item())}", flush=True)
+
+    train_dataset = diffusion.TrajectoryDataset(
+        diffusion.trajectories[train_mask],
+        diffusion.weights[train_mask],
+        meanvarmarkermaps=diffusion.meanvarmarkermaps[train_mask],
+        conditions=diffusion.conditions[train_mask],
     )
-    dataloader = make_dataloader(dataset, batch_size)
+    val_dataset = diffusion.TrajectoryDataset(
+        diffusion.trajectories[val_mask],
+        diffusion.weights[val_mask],
+        meanvarmarkermaps=diffusion.meanvarmarkermaps[val_mask],
+        conditions=diffusion.conditions[val_mask],
+    )
+    dataloader = make_dataloader(train_dataset, batch_size, shuffle=True)
+    val_dataloader = make_dataloader(val_dataset, batch_size, shuffle=False)
 
     print(f"Loaded checkpoint: {checkpoint_path}", flush=True)
     print(f"Checkpoint epoch: {start_epoch}", flush=True)
@@ -123,10 +135,14 @@ def train_from_checkpoint(
 
     model.train()
     loss_vals = []
+    stepcount = []
+    val_loss_vals = []
+    val_steps = []
 
     for epoch in range(start_epoch, target_epochs):
         print(f"Epoch {epoch + 1}/{target_epochs}", flush=True)
         for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
+            stepcount.append(epoch * len(dataloader) + step)
             traj, current_position, meanvarmarker_map, batch_weights = batch
             model_device = next(model.parameters()).device
             traj = traj.to(model_device, non_blocking=True)
@@ -163,6 +179,11 @@ def train_from_checkpoint(
             torch.save(checkpoint, output_path)
             print(f"Checkpoint saved: {output_path}", flush=True)
 
+        val_loss = diffusion.evaluate(model, val_dataloader)
+        val_loss_vals.append(val_loss)
+        val_steps.append((epoch + 1) * len(dataloader))
+        print(f"Epoch {epoch + 1} held-out validation loss: {val_loss:.6f}", flush=True)
+
         print(f"Epoch {epoch + 1} complete", flush=True)
 
     if loss_vals:
@@ -172,10 +193,10 @@ def train_from_checkpoint(
         if window > 1:
             kernel = np.ones(window, dtype=np.float32) / window
             moving_avg = np.convolve(np.asarray(loss_vals, dtype=np.float32), kernel, mode="valid")
-            plt.plot(loss_vals, alpha=0.18, label="Raw continued training loss")
-            plt.plot(range(window - 1, len(loss_vals)), moving_avg, label=f"{window}-step moving average")
+            plt.plot(stepcount, loss_vals, alpha=0.18, label="Raw continued training loss")
+            plt.plot(stepcount[window - 1:], moving_avg, label=f"{window}-step moving average")
         else:
-            plt.plot(loss_vals, label="Continued training loss")
+            plt.plot(stepcount, loss_vals, label="Continued training loss")
         plt.xlabel("Step")
         plt.ylabel("Loss")
         plt.title("Sparse diffusion continued training loss")
@@ -183,6 +204,18 @@ def train_from_checkpoint(
         plt.savefig(loss_plot_path, dpi=150, bbox_inches="tight")
         plt.close()
         print(f"Saved continued loss plot to {loss_plot_path}", flush=True)
+
+    if val_loss_vals:
+        val_plot_path = diffusion.PLOT_DIR / f"sparse_continue_validation_loss_epoch_{target_epochs}.png"
+        plt.figure()
+        plt.plot(val_steps, val_loss_vals, marker="o", label="Held-out validation loss")
+        plt.xlabel("Training Step")
+        plt.ylabel("Validation Loss")
+        plt.title("Sparse diffusion continued validation loss")
+        plt.legend()
+        plt.savefig(val_plot_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"Saved continued validation loss plot to {val_plot_path}", flush=True)
 
     final_sample_path = diffusion.PLOT_DIR / f"sparse_continue_sample_epoch_{target_epochs}.png"
     diffusion.sample_plot_traj(final_sample_path)

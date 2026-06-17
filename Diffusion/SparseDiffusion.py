@@ -23,6 +23,9 @@ CHECKPOINT_DIR.mkdir(exist_ok=True)
 PLOT_DIR = SCRIPT_DIR / "plots"
 PLOT_DIR.mkdir(exist_ok=True)
 
+###WARNING: THIS FILE DOESN'T CONDITION ON VELOCITY
+
+
 """
 HOW TO RUN THIS FILE:
 

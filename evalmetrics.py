@@ -55,7 +55,9 @@ def compute_task_completion(pos_history, pts, xs, ys, step, lateral_coverage, xm
     }
 
 
-def compute_reconstruction_rmse(mu, pts, xs, ys, step, xmin=None, ymin=None):
+def compute_reconstruction_rmse(
+    mu, pts, xs, ys, step, utility_threshold, xmin=None, ymin=None
+):
     """Compare a posterior mean map against true grid counts.
 
     Args:
@@ -63,11 +65,13 @@ def compute_reconstruction_rmse(mu, pts, xs, ys, step, xmin=None, ymin=None):
         pts: Array with columns [x, y, true_count].
         xs, ys: Grid coordinate axes used by the planner.
         step: Grid spacing.
+        utility_threshold: Ground-truth values below this threshold are treated
+            as occupied cells for the targeted reconstruction metric.
         xmin, ymin: Optional grid origin. Defaults to xs.min(), ys.min().
 
     Returns:
-        dict with global_rmse, occupied_rmse, weighted_rmse, true_map,
-        mean_map, and occupied_mask.
+        dict with global_rmse, occupied_rmse, true_map, mean_map, and
+        occupied_mask.
     """
     xs = np.asarray(xs)
     ys = np.asarray(ys)
@@ -96,20 +100,15 @@ def compute_reconstruction_rmse(mu, pts, xs, ys, step, xmin=None, ymin=None):
     error = mean_map - true_map
     global_rmse = float(np.sqrt(np.mean(error ** 2)))
 
-    occupied_mask = true_map > 0
+    occupied_mask = true_map < utility_threshold
     if np.any(occupied_mask):
         occupied_rmse = float(np.sqrt(np.mean(error[occupied_mask] ** 2)))
-        weighted_rmse = float(
-            np.sqrt(np.sum(true_map * error ** 2) / np.sum(true_map))
-        )
     else:
         occupied_rmse = 0.0
-        weighted_rmse = 0.0
 
     return {
         "global_rmse": global_rmse,
         "occupied_rmse": occupied_rmse,
-        "weighted_rmse": weighted_rmse,
         "true_map": true_map,
         "mean_map": mean_map,
         "occupied_mask": occupied_mask,

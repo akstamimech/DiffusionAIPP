@@ -8,13 +8,248 @@ from matplotlib.patches import Rectangle
 import cma
 
 from scipy.interpolate import CubicSpline
-
-
-
+from scipy.linalg import block_diag
+from scipy.sparse import csr_matrix, issparse, vstack as sparse_vstack
 
 step = 2.0
 CMA_SEED = 42
+CMA_PREDICTIVE_MAXITER = 8
+CMA_PREDICTIVE_MAXFEVALS = 20
+CMA_PREDICTIVE_POPSIZE = 20
 
+
+
+
+###FOV FUNCTIONS 
+
+def fov_lateral_radius(altitude, angle_of_view=60.0):
+    return float(altitude) * np.tan(np.deg2rad(angle_of_view) / 2.0)
+
+
+def resolution_block_size(altitude): 
+    if altitude <= 20:
+        return 1
+    elif altitude <= 30:
+        return 2
+    else:
+        return 4
+
+
+def noise_model(altitude, min_altitude=10.0):
+    min_variance = 0.01
+    max_variance = 0.05
+    b = np.log(4.0) / 30.0
+
+    return min_variance + (max_variance - min_variance) * (
+        1.0 - np.exp(-b * (altitude - min_altitude))
+    )
+
+
+def build_sensor_matrix(fov, cz, xs, ys, return_block_ids=False):
+    nx = len(xs)
+    ny = len(ys)
+    block_size = resolution_block_size(cz)
+
+    visible_indices = []
+
+    for x, y in fov:
+        xi = int(np.argmin(np.abs(xs - x)))
+        yi = int(np.argmin(np.abs(ys - y)))
+
+        if np.isclose(xs[xi], x) and np.isclose(ys[yi], y):
+            visible_indices.append((yi, xi))
+
+    visible_set = set(visible_indices)
+    sensor_rows = []
+    sensor_columns = []
+    sensor_values = []
+    block_keys = []
+
+    for row_index, (yi, xi) in enumerate(visible_indices):
+        block_y0 = (yi // block_size) * block_size
+        block_x0 = (xi // block_size) * block_size
+        block_keys.append((block_y0, block_x0))
+        block_indices = []
+
+        for dy in range(block_size):
+            for dx in range(block_size):
+                block_y = block_y0 + dy
+                block_x = block_x0 + dx
+
+                if block_y >= ny or block_x >= nx:
+                    continue
+
+                if (block_y, block_x) in visible_set:
+                    block_indices.append(block_y * nx + block_x)
+
+        if block_indices:
+            weight = 1.0 / len(block_indices)
+            sensor_rows.extend([row_index] * len(block_indices))
+            sensor_columns.extend(block_indices)
+            sensor_values.extend([weight] * len(block_indices))
+
+    sensor = csr_matrix(
+        (sensor_values, (sensor_rows, sensor_columns)),
+        shape=(len(visible_indices), nx * ny),
+        dtype=float,
+    )
+
+    if not return_block_ids:
+        return sensor
+
+    block_lookup = {
+        block_key: block_id
+        for block_id, block_key in enumerate(dict.fromkeys(block_keys))
+    }
+    block_ids = np.asarray([block_lookup[key] for key in block_keys], dtype=int)
+    return sensor, block_ids
+
+
+def build_correlated_noise_covariance(block_ids, variance):
+    block_ids = np.asarray(block_ids)
+    row_variances = np.asarray(variance, dtype=float)
+    if row_variances.ndim == 0:
+        row_variances = np.full(len(block_ids), float(row_variances))
+    elif row_variances.shape != (len(block_ids),):
+        raise ValueError("variance must be scalar or contain one value per sensor row")
+
+    shared_block = block_ids[:, None] == block_ids[None, :]
+    covariance = np.sqrt(row_variances[:, None] * row_variances[None, :])
+    return np.where(shared_block, covariance, 0.0)
+
+
+def sample_correlated_sensor_noise(block_ids, variance, rng):
+    block_ids = np.asarray(block_ids)
+    row_variances = np.asarray(variance, dtype=float)
+    if row_variances.ndim == 0:
+        row_variances = np.full(len(block_ids), float(row_variances))
+    elif row_variances.shape != (len(block_ids),):
+        raise ValueError("variance must be scalar or contain one value per sensor row")
+
+    noise = np.zeros(len(block_ids), dtype=float)
+    for block_id in np.unique(block_ids):
+        rows = np.flatnonzero(block_ids == block_id)
+        block_variance = float(row_variances[rows[0]])
+        if not np.allclose(row_variances[rows], block_variance):
+            raise ValueError("rows in the same sensor block must have equal variance")
+        noise[rows] = rng.normal(0.0, np.sqrt(block_variance))
+    return noise
+
+
+def measurement_noise_covariance(R, row_count):
+    noise = np.asarray(R, dtype=float)
+    if noise.ndim == 0:
+        return float(noise) * np.eye(row_count)
+    if noise.shape == (row_count,):
+        return np.diag(noise)
+    if noise.shape == (row_count, row_count):
+        return noise
+    raise ValueError(
+        "R must be scalar, one variance per sensor row, or a full covariance matrix"
+    )
+
+
+def compress_shared_sensor_rows(sensor, z_meas, R, block_ids):
+    block_ids = np.asarray(block_ids)
+    if block_ids.shape != (sensor.shape[0],):
+        raise ValueError("block_ids must contain one id per sensor row")
+
+    _, unique_rows = np.unique(block_ids, return_index=True)
+    unique_rows = np.sort(unique_rows)
+    compressed_sensor = sensor[unique_rows]
+    if not issparse(compressed_sensor):
+        compressed_sensor = csr_matrix(compressed_sensor)
+    else:
+        compressed_sensor = compressed_sensor.tocsr()
+
+    compressed_z = None
+    if z_meas is not None:
+        compressed_z = np.asarray(z_meas)[unique_rows]
+
+    noise_covariance = measurement_noise_covariance(R, sensor.shape[0])
+    compressed_R = noise_covariance[np.ix_(unique_rows, unique_rows)]
+    return compressed_sensor, compressed_z, compressed_R
+
+
+def fov_grid_points(cx, cy, cz, xs, ys, angle_of_view=60.0):
+    radius = fov_lateral_radius(cz, angle_of_view)
+    visible_xs = np.asarray(xs)[
+        (np.asarray(xs) >= cx - radius) & (np.asarray(xs) <= cx + radius)
+    ]
+    visible_ys = np.asarray(ys)[
+        (np.asarray(ys) >= cy - radius) & (np.asarray(ys) <= cy + radius)
+    ]
+    return [(x, y) for x in visible_xs for y in visible_ys]
+
+
+def future_sensor_model_3d(
+    spline_path_3d,
+    xs,
+    ys,
+    angle_of_view=60.0,
+    trajectory_stride=4,
+    max_measurements=64,
+):
+    selected_path = list(spline_path_3d[::trajectory_stride])
+    if spline_path_3d and selected_path[-1] != spline_path_3d[-1]:
+        selected_path.append(spline_path_3d[-1])
+
+    sensor_blocks = []
+    covariance_blocks = []
+    for px, py, pz in selected_path:
+        cx = float(xs[np.argmin(np.abs(xs - px))])
+        cy = float(ys[np.argmin(np.abs(ys - py))])
+        fov = fov_grid_points(cx, cy, pz, xs, ys, angle_of_view)
+        sensor, block_ids = build_sensor_matrix(
+            fov, pz, xs, ys, return_block_ids=True
+        )
+        if sensor.shape[0] > 0:
+            noise_covariance = build_correlated_noise_covariance(
+                block_ids, noise_model(pz)
+            )
+            sensor, _, noise_covariance = compress_shared_sensor_rows(
+                sensor, None, noise_covariance, block_ids
+            )
+            sensor_blocks.append(sensor)
+            covariance_blocks.append(noise_covariance)
+
+    if not sensor_blocks:
+        return (
+            csr_matrix((0, len(xs) * len(ys)), dtype=float),
+            np.zeros((0, 0), dtype=float),
+        )
+
+    sensor = sparse_vstack(sensor_blocks, format="csr")
+    noise_covariance = block_diag(*covariance_blocks)
+    if max_measurements is not None and sensor.shape[0] > max_measurements:
+        sample_indices = np.linspace(
+            0, sensor.shape[0] - 1, max_measurements, dtype=int
+        )
+        sensor = sensor[sample_indices]
+        noise_covariance = noise_covariance[np.ix_(sample_indices, sample_indices)]
+    return sensor, noise_covariance
+
+
+def future_sensor_matrix_3d(
+    spline_path_3d,
+    xs,
+    ys,
+    angle_of_view=60.0,
+    trajectory_stride=5,
+    max_measurements=64,
+):
+    sensor, _ = future_sensor_model_3d(
+        spline_path_3d,
+        xs,
+        ys,
+        angle_of_view=angle_of_view,
+        trajectory_stride=trajectory_stride,
+        max_measurements=max_measurements,
+    )
+    return sensor
+
+
+###CMAES, utility, and trajectory functions
 
 
 def sampler(cx, cy, X, Y, P_history, samplestep):
@@ -49,23 +284,24 @@ def sampler(cx, cy, X, Y, P_history, samplestep):
 
     return np.array([dx, dy]), (gx, gy), (target_x, target_y)
 
-"""
-messing around with utility function at the moment
-"""
+
 
 
 #importance_filter returns variance form for easy utility deduction!
-def importance_filter(mu, P, beta, threshold = 0.7, eps=1e-12): 
+##LOWER CONFIDENCE BOUND!!
+def importance_filter(mu, P, beta, threshold = 0.3, eps=1e-12): 
+
+
     sigma = np.sqrt(np.diag(P))
 
-    mu_min, mu_max = np.min(mu), np.max(mu)
-    sigma_min, sigma_max = np.min(sigma), np.max(sigma)
-    mu_norm = (mu - mu_min) / max(mu_max - mu_min, eps)
-    sigma_norm = (sigma - sigma_min) / max(sigma_max - sigma_min, eps)
-    importance = mu_norm + beta * sigma_norm
-    importance_threshold = np.quantile(importance, threshold)
+    # mu_min, mu_max = np.min(mu), np.max(mu)
+    # sigma_min, sigma_max = np.min(sigma), np.max(sigma)
+    # mu_norm = (mu - mu_min) / max(mu_max - mu_min, eps)
+    # sigma_norm = (sigma - sigma_min) / max(sigma_max - sigma_min, eps)
+    importance = mu - beta * sigma
+    importance_threshold = threshold
 
-    importance_mask = importance >= importance_threshold
+    importance_mask = importance <= importance_threshold
 
     if not np.any(importance_mask):
         importance_mask = np.ones_like(importance, dtype=bool)
@@ -73,11 +309,11 @@ def importance_filter(mu, P, beta, threshold = 0.7, eps=1e-12):
 
     sigma2 = np.diag(P)
 
-    sigma2_min, sigma2_max = np.min(sigma2), np.max(sigma2)
-    sigma2_norm = (sigma2 - sigma2_min) / max(sigma2_max - sigma2_min, eps)
+    # sigma2_min, sigma2_max = np.min(sigma2), np.max(sigma2)
+    # sigma2_norm = (sigma2 - sigma2_min) / max(sigma2_max - sigma2_min, eps)
 
     utility = np.zeros_like(mu)
-    utility[importance_mask] = sigma2_norm[importance_mask]
+    utility[importance_mask] = sigma2[importance_mask]
 
     return utility
 
@@ -124,6 +360,126 @@ def grid_measure(filtered_utility, xs, ys, margin=None):
     return util_values
 
 
+def build_pyramid_lattice_3d(xs, ys, zmin, zmax, margin=None): ###changing hardcoded lattice
+    if margin is None:
+        margin = step * 2
+
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    xmin, xmax = xs.min() + margin, xs.max() - margin
+    ymin, ymax = ys.min() + margin, ys.max() - margin
+
+    # if xmin > xmax or ymin > ymax:
+    #     raise ValueError("map too small")
+
+    def snap_positions(values, grid):
+        return [float(grid[np.argmin(np.abs(grid - value))]) for value in values]
+
+    low_x = snap_positions(np.linspace(xmin, xmax, 4), xs)
+    low_y = snap_positions(np.linspace(ymin, ymax, 4), ys)
+    middle_x = snap_positions(np.linspace(xmin, xmax, 3), xs)
+    middle_y = snap_positions(np.linspace(ymin, ymax, 3), ys)
+    # middle_x = snap_positions(
+    #     [xmin + (xmax - xmin) / 3.0, xmin + 2.0 * (xmax - xmin) / 3.0],
+    #     xs,
+    # )
+    # middle_y = snap_positions(
+    #     [ymin + (ymax - ymin) / 3.0, ymin + 2.0 * (ymax - ymin) / 3.0],
+    #     ys,
+    # )
+    mt_x = snap_positions(np.linspace(xmin, xmax, 2), xs)
+    mt_y = snap_positions(np.linspace(ymin, ymax, 2), ys)
+    top_x = snap_positions(np.linspace(xmin, xmax, 1), xs)
+    top_y = snap_positions(np.linspace(ymin, ymax, 1), ys)
+
+    middle_z = (float(zmin) + float(zmax)) / 3.0
+    mt_z = (float(zmin) + float(zmax)) * 2.0 / 3.0
+    top_z = float(zmax)
+    lattice = [(x, y, float(zmin)) for x in low_x for y in low_y]
+    lattice.extend((x, y, middle_z) for x in middle_x for y in middle_y)
+    lattice.extend((x, y, mt_z) for x in mt_x for y in mt_y)
+    lattice.append((top_x[0], top_y[0], top_z))
+    return list(dict.fromkeys(lattice))
+
+
+def covariance_after_sensor(P, sensor, R):
+    if sensor.shape[0] == 0:
+        return P.copy()
+
+    noise_covariance = measurement_noise_covariance(R, sensor.shape[0])
+
+    projected_cov = np.asarray(sensor @ P)
+    innovation_cov = np.asarray(sensor @ projected_cov.T) + noise_covariance
+    try:
+        solved = np.linalg.solve(innovation_cov, projected_cov)
+    except np.linalg.LinAlgError:
+        solved = np.linalg.pinv(innovation_cov) @ projected_cov
+
+    posterior = P - projected_cov.T @ solved
+    return 0.5 * (posterior + posterior.T)
+
+
+def grid_search_3d(
+    mu,
+    P,
+    xs,
+    ys,
+    start_pose,
+    beta,
+    utility_threshold,
+    planning_horizon,
+    zmin,
+    zmax,
+    alpha=0.02,
+    angle_of_view=60.0,
+    max_measurements=64,
+):
+    available = build_pyramid_lattice_3d(xs, ys, zmin, zmax)
+    simulated_covariance = P.copy()
+    current_pose = np.asarray(start_pose, dtype=float)
+    selected_waypoints = []
+
+    for _ in range(min(planning_horizon, len(available))):
+        utility = importance_filter(
+            mu, simulated_covariance, beta, threshold=utility_threshold
+        )
+        importance_mask = utility > 0
+        scored_candidates = []
+
+        for candidate in available:
+            sensor, measurement_noise = future_sensor_model_3d(
+                [candidate],
+                xs,
+                ys,
+                angle_of_view=angle_of_view,
+                trajectory_stride=1,
+                max_measurements=max_measurements,
+            )
+            gain = masked_expected_variance_reduction_from_sensor(
+                simulated_covariance,
+                importance_mask,
+                sensor,
+                measurement_noise,
+            )
+            distance = float(
+                np.linalg.norm(np.asarray(candidate, dtype=float) - current_pose)
+            )
+            score = gain / max(distance, step)
+            scored_candidates.append((score, candidate, sensor, measurement_noise))
+
+        _, best, best_sensor, best_variance = max(
+            scored_candidates, key=lambda item: item[0]
+        )
+        selected_waypoints.append(best)
+        available.remove(best)
+        simulated_covariance = covariance_after_sensor(
+            simulated_covariance, best_sensor, best_variance
+        )
+        current_pose = np.asarray(best, dtype=float)
+
+    return selected_waypoints
+
+
 def next_best_waypoint(grid_util_values, curr_x, curr_y, alpha = 0.1): 
     scored = []
     for util, (x, y) in grid_util_values:
@@ -139,8 +495,23 @@ def next_best_waypoint(grid_util_values, curr_x, curr_y, alpha = 0.1):
 def flatten_waypoints(waypoints):
     return np.array([coord for pt in waypoints for coord in pt], dtype=float)
 
+def flatten_waypoints_3d(waypoints_3d):
+    waypoints_3d = np.asarray(waypoints_3d, dtype=float)
+    if waypoints_3d.size == 0:
+        return np.array([], dtype=float)
+    if waypoints_3d.ndim != 2 or waypoints_3d.shape[1] != 3:
+        raise ValueError("3D waypoints must have shape (N, 3).")
+    return waypoints_3d.reshape(-1)
+
+
 def unflatten_waypoints(z):
     return [(z[i], z[i + 1]) for i in range(0, len(z), 2)]
+
+def unflatten_waypoints_3d(values):
+    values = np.asarray(values, dtype=float)
+    if values.size % 3 != 0:
+        raise ValueError("A flattened 3D waypoint array must contain a multiple of 3 values.")
+    return [tuple(point) for point in values.reshape(-1, 3)]
 
 
 def clip_waypoints_continuous(waypoints, xs, ys, margin=None):
@@ -157,6 +528,24 @@ def clip_waypoints_continuous(waypoints, xs, ys, margin=None):
         clipped.append((x, y))
 
     return clipped
+
+
+def clip_waypoints_continuous_3d(waypoints_3d, xs, ys, zmin, zmax, margin=None):
+    if margin is None:
+        margin = step * 2
+
+    xmin, xmax = np.min(xs), np.max(xs)
+    ymin, ymax = np.min(ys), np.max(ys)
+
+    return [
+        (
+            float(np.clip(x, xmin + margin, xmax - margin)),
+            float(np.clip(y, ymin + margin, ymax - margin)),
+            float(np.clip(z, zmin, zmax)),
+        )
+        for x, y, z in waypoints_3d
+    ]
+
 
 
 def snap_waypoints_to_grid(waypoints, xs, ys):
@@ -218,6 +607,32 @@ def masked_expected_variance_reduction(P, mask, obs_indices, R):
         solved = np.linalg.pinv(S) @ cross_cov.T
         reduction = np.sum(cross_cov.T * solved, axis=0)
 
+    prior_diag = np.diag(P)[mask_indices]
+    reduction = np.clip(reduction, 0.0, prior_diag)
+    return float(np.sum(reduction))
+
+
+def masked_expected_variance_reduction_from_sensor(P, mask, sensor, R):
+    if sensor.shape[0] == 0:
+        return 0.0
+
+    mask_indices = np.flatnonzero(mask)
+    if len(mask_indices) == 0:
+        mask_indices = np.arange(P.shape[0])
+
+    projected_cov = np.asarray(sensor @ P)
+    innovation_cov = (
+        np.asarray(sensor @ projected_cov.T)
+        + measurement_noise_covariance(R, sensor.shape[0])
+    )
+    cross_cov = projected_cov[:, mask_indices].T
+
+    try:
+        solved = np.linalg.solve(innovation_cov, cross_cov.T)
+    except np.linalg.LinAlgError:
+        solved = np.linalg.pinv(innovation_cov) @ cross_cov.T
+
+    reduction = np.sum(cross_cov * solved.T, axis=1)
     prior_diag = np.diag(P)[mask_indices]
     reduction = np.clip(reduction, 0.0, prior_diag)
     return float(np.sum(reduction))
@@ -287,6 +702,87 @@ def trajectory_objective(
         total_score += utility[idx]
         total_score -= 0.01 * np.hypot(px - curr_x, py - curr_y)
         curr_x, curr_y = px, py
+
+    return -total_score
+
+
+def trajectory_objective_3d(
+    values,
+    mu,
+    P,
+    xs,
+    ys,
+    start_x,
+    start_y,
+    start_z,
+    beta,
+    utility_threshold,
+    zmin,
+    zmax,
+    predictive_variance=True,
+    cached_utility=None,
+    cached_importance_mask=None,
+):
+    raw_control_waypoints = unflatten_waypoints_3d(values)
+    control_waypoints = clip_waypoints_continuous_3d(
+        raw_control_waypoints, xs, ys, zmin, zmax
+    )
+    spline_path_3d = build_spline_trajectory_3d(
+        start_x,
+        start_y,
+        start_z,
+        control_waypoints,
+        samples_per_segment=5,
+    )
+    spline_path_2d = [(x, y) for x, y, _ in spline_path_3d]
+
+    utility = cached_utility
+    if utility is None:
+        utility = importance_filter(mu, P, beta, threshold=utility_threshold)
+
+    margin = step * 2
+    xmin, xmax = np.min(xs), np.max(xs)
+    ymin, ymax = np.min(ys), np.max(ys)
+    penalty = 0.0
+
+    for x, y, z in raw_control_waypoints:
+        if (
+            x < xmin + margin
+            or x > xmax - margin
+            or y < ymin + margin
+            or y > ymax - margin
+            or z < zmin
+            or z > zmax
+        ):
+            penalty -= 1000.0
+
+    previous = np.array([start_x, start_y, start_z], dtype=float)
+    total_distance = 0.0
+    for point in spline_path_3d:
+        point = np.asarray(point, dtype=float)
+        total_distance += float(np.linalg.norm(point - previous))
+        previous = point
+
+    if predictive_variance:
+        importance_mask = cached_importance_mask
+        if importance_mask is None:
+            importance_mask = utility > 0
+        sensor, measurement_variances = future_sensor_model_3d(
+            spline_path_3d,
+            xs,
+            ys,
+        )
+        variance_reduction = masked_expected_variance_reduction_from_sensor(
+            P, importance_mask, sensor, measurement_variances
+        )
+        rate_score = variance_reduction / max(total_distance, step)
+        total_score = penalty + rate_score
+    else:
+        total_score = penalty
+        X, Y = np.meshgrid(xs, ys)
+        for x, y in spline_path_2d:
+            idx = np.argmin((X.ravel() - x) ** 2 + (Y.ravel() - y) ** 2)
+            total_score += utility[idx]
 
     return -total_score
 
@@ -361,6 +857,107 @@ def cma_es_refine_waypoints(
     return snap_waypoints_to_grid(best_waypoints, xs, ys)
 
 
+def cma_es_refine_waypoints_3d(
+    initial_waypoints,
+    mu,
+    P,
+    xs,
+    ys,
+    cx,
+    cy,
+    cz,
+    beta,
+    utility_threshold,
+    zmin,
+    zmax,
+    predictive_variance=True,
+    maxiter=None,
+    popsize=None,
+    maxfevals=None,
+):
+    margin = step * 2
+    xmin, xmax = np.min(xs), np.max(xs)
+    ymin, ymax = np.min(ys), np.max(ys)
+    initial_waypoints = clip_waypoints_continuous_3d(
+        initial_waypoints,
+        xs,
+        ys,
+        zmin,
+        zmax,
+        margin=margin,
+    )
+    x0 = flatten_waypoints_3d(initial_waypoints)
+    sigma0 = 4.0
+
+    lower_bounds = []
+    upper_bounds = []
+    for _ in initial_waypoints:
+        lower_bounds.extend([xmin + margin, ymin + margin, zmin])
+        upper_bounds.extend([xmax - margin, ymax - margin, zmax])
+
+    if maxiter is None:
+        maxiter = CMA_PREDICTIVE_MAXITER if predictive_variance else 40
+    if popsize is None:
+        popsize = CMA_PREDICTIVE_POPSIZE if predictive_variance else 12
+    if maxfevals is None and predictive_variance:
+        maxfevals = CMA_PREDICTIVE_MAXFEVALS
+
+    cma_options = {
+        "bounds": [lower_bounds, upper_bounds],
+        "maxiter": maxiter,
+        "popsize": popsize,
+        "seed": CMA_SEED,
+        "verb_disp": 0,
+        "verb_log": 0,
+    }
+    if maxfevals is not None:
+        cma_options["maxfevals"] = maxfevals
+
+    cached_utility = importance_filter(mu, P, beta, threshold=utility_threshold)
+    cached_importance_mask = cached_utility > 0
+
+    es = cma.CMAEvolutionStrategy(
+        x0,
+        sigma0,
+        cma_options,
+    )
+
+    while not es.stop() and (
+        maxfevals is None or es.countevals < maxfevals
+    ):
+        solutions = es.ask()
+        values = [
+            trajectory_objective_3d(
+                solution,
+                mu,
+                P,
+                xs,
+                ys,
+                cx,
+                cy,
+                cz,
+                beta,
+                utility_threshold,
+                zmin,
+                zmax,
+                predictive_variance=predictive_variance,
+                cached_utility=cached_utility,
+                cached_importance_mask=cached_importance_mask,
+            )
+            for solution in solutions
+        ]
+        es.tell(solutions, values)
+
+    return clip_waypoints_continuous_3d(
+        unflatten_waypoints_3d(es.result.xbest),
+        xs,
+        ys,
+        zmin,
+        zmax,
+        margin=margin,
+    )
+
+
 
 
 def build_spline_trajectory(cx, cy, control_waypoints, samples_per_segment=10):
@@ -394,6 +991,52 @@ def build_spline_trajectory(cx, cy, control_waypoints, samples_per_segment=10):
     return trajectory
 
 
+def build_spline_trajectory_3d(
+    cx,
+    cy,
+    cz,
+    control_waypoints,
+    samples_per_segment=10,
+):
+    waypoints = np.asarray(
+        [(cx, cy, cz)] + list(control_waypoints),
+        dtype=float,
+    )
+
+    deltas = np.diff(waypoints, axis=0)
+    segment_lengths = np.linalg.norm(deltas, axis=1)
+    t = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+
+    keep = np.concatenate([[True], np.diff(t) > 1e-9])
+    waypoints = waypoints[keep]
+    t = t[keep]
+
+    if len(t) < 2:
+        return [tuple(waypoints[0])]
+
+    cs_x = CubicSpline(t, waypoints[:, 0], bc_type="natural")
+    cs_y = CubicSpline(t, waypoints[:, 1], bc_type="natural")
+    cs_z = CubicSpline(t, waypoints[:, 2], bc_type="natural")
+
+    trajectory = []
+    for i in range(len(t) - 1):
+        sample_times = np.linspace(
+            t[i], t[i + 1],
+            samples_per_segment,
+            endpoint=False,
+        )
+
+        trajectory.extend(
+            (float(cs_x(s)), float(cs_y(s)), float(cs_z(s)))
+            for s in sample_times
+        )
+
+    trajectory.append(tuple(waypoints[-1]))
+    return trajectory
+
+
+
+
 
 
 
@@ -412,19 +1055,27 @@ def utility_function(mu, P, threshold, beta, eps=1e-12):
     utility = ((1 - beta) * mu_norm) + (beta * sigma_norm) - threshold
     return np.asarray(utility)
 
-def kalman_update(mu, P, sensor, z_meas, R):
+def kalman_update(mu, P, sensor, z_meas, R, block_ids=None):
+    if block_ids is not None:
+        sensor, z_meas, R = compress_shared_sensor_rows(
+            sensor, z_meas, R, block_ids
+        )
+
     v = z_meas - (sensor @ mu)
 
-    S = sensor @ P @ sensor.T + R * np.eye(sensor.shape[0])
-    K = P @ sensor.T @ np.linalg.inv(S)
+    projected_cov = np.asarray(sensor @ P)
+    S = np.asarray(sensor @ projected_cov.T) + measurement_noise_covariance(
+        R, sensor.shape[0]
+    )
+    K = projected_cov.T @ np.linalg.pinv(S)
 
     mu = mu + (K @ v).flatten()
-    P = P - K @ sensor @ P
+    P = P - K @ projected_cov
 
     return mu, P
 
 
-def initialize_gp(sigma2=10.0, lengthscale=10.0, xmin=0.0, xmax=100.0, ymin=0.0, ymax=100.0):
+def initialize_gp(sigma2=0.101**2, lengthscale=4.79, xmin=0.0, xmax=100.0, ymin=0.0, ymax=100.0):
     kernel = ConstantKernel(
         sigma2, constant_value_bounds="fixed"
     ) * Matern(
@@ -447,7 +1098,33 @@ def initialize_gp(sigma2=10.0, lengthscale=10.0, xmin=0.0, xmax=100.0, ymin=0.0,
     return gp, X_test, mean, cov, xs, ys, X, Y, xmin, xmax, ymin, ymax, step
 
 
-def create_plots_and_gifs(path, mu_history, P_history, step_numbers, grad_history, pos_history, utility_history, sorted_util_values_list, X, Y, xs, ys, cx, cy, lateral_coverage, xmin, xmax, ymin, ymax, plot_utility=True, plot_grad=True, planned_path_history=None, control_waypoint_history=None):
+def create_plots_and_gifs(path, mu_history, P_history, step_numbers, grad_history, pos_history, utility_history, sorted_util_values_list, X, Y, xs, ys, cx, cy, lateral_coverage, xmin, xmax, ymin, ymax, plot_utility=True, plot_grad=True, planned_path_history=None, control_waypoint_history=None, pose_history=None, angle_of_view=60.0):
+    def footprint_for_frame(index=None):
+        if pose_history:
+            if index is None:
+                px, py, pz = pose_history[-1]
+            else:
+                px, py, pz = pose_history[min(index, len(pose_history) - 1)]
+            return float(px), float(py), fov_lateral_radius(pz, angle_of_view)
+
+        if index is None:
+            return float(cx), float(cy), float(lateral_coverage)
+
+        px, py = pos_history[min(index, len(pos_history) - 1)]
+        return float(px), float(py), float(lateral_coverage)
+
+    def add_fov_rectangle(ax, px, py, radius, edgecolor):
+        ax.add_patch(
+            Rectangle(
+                (px - radius, py - radius),
+                2 * radius,
+                2 * radius,
+                linewidth=2,
+                edgecolor=edgecolor,
+                facecolor="none",
+            )
+        )
+
     def overlay_planned_path(ax, path_points):
         if not path_points:
             return
@@ -537,19 +1214,9 @@ def create_plots_and_gifs(path, mu_history, P_history, step_numbers, grad_histor
         aspect="equal"
     )
 
-    x_min = cx - lateral_coverage
-    y_min = cy - lateral_coverage
-
-    rect = Rectangle(
-        (x_min, y_min),
-        2 * lateral_coverage,
-        2 * lateral_coverage,
-        linewidth=2,
-        edgecolor="red",
-        facecolor="none"
-    )
-    ax[1].add_patch(rect)
-    ax[1].plot(cx, cy, "wo", markersize=6)
+    final_x, final_y, final_radius = footprint_for_frame()
+    add_fov_rectangle(ax[1], final_x, final_y, final_radius, "red")
+    ax[1].plot(final_x, final_y, "wo", markersize=6)
     if planned_path_history:
         overlay_planned_path(ax[1], planned_path_history[-1])
     if control_waypoint_history:
@@ -593,19 +1260,9 @@ def create_plots_and_gifs(path, mu_history, P_history, step_numbers, grad_histor
             vmax=utility_vmax,
         )
 
-        x_min = cx - lateral_coverage
-        y_min = cy - lateral_coverage
-
-        rect = Rectangle(
-            (x_min, y_min),
-            2 * lateral_coverage,
-            2 * lateral_coverage,
-            linewidth=2,
-            edgecolor="red",
-            facecolor="none"
-        )
-        ax[1].add_patch(rect)
-        ax[1].plot(cx, cy, "wo", markersize=6)
+        final_x, final_y, final_radius = footprint_for_frame()
+        add_fov_rectangle(ax[1], final_x, final_y, final_radius, "red")
+        ax[1].plot(final_x, final_y, "wo", markersize=6)
         if planned_path_history:
             overlay_planned_path(ax[1], planned_path_history[-1])
         if control_waypoint_history:
@@ -638,18 +1295,9 @@ def create_plots_and_gifs(path, mu_history, P_history, step_numbers, grad_histor
                 vmax=vmax
             )
 
-            px, py = pos_history[min(i, len(pos_history) - 1)]
+            px, py, frame_radius = footprint_for_frame(i)
             plt.plot(px, py, "wo", markersize=5)
-            plt.gca().add_patch(
-                Rectangle(
-                    (px - lateral_coverage, py - lateral_coverage),
-                    2 * lateral_coverage,
-                    2 * lateral_coverage,
-                    linewidth=2,
-                    edgecolor="cyan",
-                    facecolor="none"
-                )
-            )
+            add_fov_rectangle(plt.gca(), px, py, frame_radius, "cyan")
             if planned_path_history and i < len(planned_path_history):
                 overlay_planned_path(plt.gca(), planned_path_history[i])
             if control_waypoint_history and i < len(control_waypoint_history):
@@ -693,18 +1341,9 @@ def create_plots_and_gifs(path, mu_history, P_history, step_numbers, grad_histor
                     for util, (x, y) in sorted_util_values_list[i]:
                         plt.scatter(x, y, c='yellow', s=35, edgecolors='black', alpha=0.9)
 
-                px, py = pos_history[min(i, len(pos_history) - 1)]
+                px, py, frame_radius = footprint_for_frame(i)
                 plt.plot(px, py, "wo", markersize=5)
-                plt.gca().add_patch(
-                    Rectangle(
-                        (px - lateral_coverage, py - lateral_coverage),
-                        2 * lateral_coverage,
-                        2 * lateral_coverage,
-                        linewidth=2,
-                        edgecolor="cyan",
-                        facecolor="none"
-                    )
-                )
+                add_fov_rectangle(plt.gca(), px, py, frame_radius, "cyan")
                 if planned_path_history and i < len(planned_path_history):
                     overlay_planned_path(plt.gca(), planned_path_history[i])
                 if control_waypoint_history and i < len(control_waypoint_history):

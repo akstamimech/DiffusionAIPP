@@ -9,6 +9,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -18,11 +19,13 @@ import SparseTransDiffusion as diffusion
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
-def make_dataloader(dataset, batch_size, shuffle=True):
+def make_dataloader(dataset, batch_size, shuffle=True, num_workers=None):
     requested_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", "0"))
-    if requested_workers <= 0:
+    if num_workers is not None:
+        requested_workers = num_workers
+    elif requested_workers <= 0:
         requested_workers = 2 if torch.cuda.is_available() else 0
-    num_workers = min(requested_workers, 4) if torch.cuda.is_available() else 0
+    num_workers = max(0, requested_workers) if torch.cuda.is_available() else 0
 
     kwargs = {
         "batch_size": batch_size,
@@ -58,13 +61,15 @@ def configure_optimizer_param_groups(optimizer, lr, weight_decay):
         param_group["weight_decay"] = weight_decay
 
 
-def load_checkpoint(model, optimizer, checkpoint_path, reset_optimizer=False):
+def load_checkpoint(model, optimizer, scheduler, checkpoint_path, reset_optimizer=False):
     checkpoint = torch.load(checkpoint_path, map_location=diffusion.device)
 
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         model.load_state_dict(diffusion.remap_legacy_state_dict_keys(checkpoint["model_state_dict"]))
         if "optimizer_state_dict" in checkpoint and not reset_optimizer:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scheduler_state_dict" in checkpoint and not reset_optimizer:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         elif reset_optimizer:
             print("Resetting optimizer state; only model weights were loaded.", flush=True)
         start_epoch = int(checkpoint.get("epoch", 0))
@@ -78,6 +83,51 @@ def load_checkpoint(model, optimizer, checkpoint_path, reset_optimizer=False):
     return start_epoch, previous_loss
 
 
+@torch.no_grad()
+def evaluate(model, dataloader):
+    was_training = model.training
+    model.eval()
+    loss_sum = 0.0
+    total_samples = 0
+    model_device = next(model.parameters()).device
+
+    for batch in dataloader:
+        if len(batch) == 5:
+            traj, current_position, meanvarmarker_map, initial_heading_velocity, batch_weights = batch
+        else:
+            traj, current_position, meanvarmarker_map, batch_weights = batch
+            initial_heading_velocity = None
+
+        traj = traj.to(model_device, non_blocking=True)
+        current_position = current_position.to(model_device, non_blocking=True)
+        meanvarmarker_map = meanvarmarker_map.to(model_device, non_blocking=True)
+        if initial_heading_velocity is not None:
+            initial_heading_velocity = initial_heading_velocity.to(model_device, non_blocking=True)
+        batch_weights = batch_weights.to(model_device, non_blocking=True)
+
+        t = torch.randint(0, diffusion.T, (traj.shape[0],), device=traj.device).long()
+        loss = diffusion.get_loss(
+            model,
+            traj,
+            t,
+            meanvarmarker_map,
+            current_position,
+            initial_heading_velocity,
+            weights=batch_weights,
+        )
+
+        batch_size = traj.shape[0]
+        loss_sum += loss.item() * batch_size
+        total_samples += batch_size
+
+    if was_training:
+        model.train()
+
+    if total_samples <= 0:
+        return float("nan")
+    return loss_sum / total_samples
+
+
 def train_from_checkpoint(
     checkpoint_path,
     target_epochs,
@@ -86,16 +136,26 @@ def train_from_checkpoint(
     weight_decay,
     save_every,
     reset_optimizer,
+    num_workers,
 ):
     model = diffusion.NoisePredictor().to(diffusion.device)
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=target_epochs,
+        eta_min=diffusion.MIN_LR,
+    )
     start_epoch, previous_loss = load_checkpoint(
         model,
         optimizer,
+        scheduler,
         checkpoint_path,
         reset_optimizer=reset_optimizer,
     )
     configure_optimizer_param_groups(optimizer, lr=lr, weight_decay=weight_decay)
+    if reset_optimizer:
+        for _ in range(start_epoch):
+            scheduler.step()
     diffusion.model = model
 
     if target_epochs <= start_epoch:
@@ -113,15 +173,17 @@ def train_from_checkpoint(
         diffusion.weights[train_mask],
         meanvarmarkermaps=diffusion.meanvarmarkermaps[train_mask],
         conditions=diffusion.conditions[train_mask],
+        initial_heading_velocities=diffusion.initial_heading_velocities[train_mask],
     )
     val_dataset = diffusion.TrajectoryDataset(
         diffusion.trajectories[val_mask],
         diffusion.weights[val_mask],
         meanvarmarkermaps=diffusion.meanvarmarkermaps[val_mask],
         conditions=diffusion.conditions[val_mask],
+        initial_heading_velocities=diffusion.initial_heading_velocities[val_mask],
     )
-    dataloader = make_dataloader(train_dataset, batch_size, shuffle=True)
-    val_dataloader = make_dataloader(val_dataset, batch_size, shuffle=False)
+    dataloader = make_dataloader(train_dataset, batch_size, shuffle=True, num_workers=num_workers)
+    val_dataloader = make_dataloader(val_dataset, batch_size, shuffle=False, num_workers=num_workers)
 
     print(f"Loaded checkpoint: {checkpoint_path}", flush=True)
     print(f"Checkpoint epoch: {start_epoch}", flush=True)
@@ -131,23 +193,34 @@ def train_from_checkpoint(
     print(f"Using device: {diffusion.device}", flush=True)
     print(f"Using lr: {lr}", flush=True)
     print(f"Using weight_decay: {weight_decay}", flush=True)
+    print(f"DataLoader workers: {dataloader.num_workers}", flush=True)
     print(f"Reset optimizer: {reset_optimizer}", flush=True)
 
     model.train()
     loss_vals = []
     stepcount = []
+    epoch_train_loss_vals = []
+    epoch_steps = []
     val_loss_vals = []
     val_steps = []
 
     for epoch in range(start_epoch, target_epochs):
         print(f"Epoch {epoch + 1}/{target_epochs}", flush=True)
+        epoch_loss_sum = 0.0
+        epoch_sample_count = 0
         for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             stepcount.append(epoch * len(dataloader) + step)
-            traj, current_position, meanvarmarker_map, batch_weights = batch
+            if len(batch) == 5:
+                traj, current_position, meanvarmarker_map, initial_heading_velocity, batch_weights = batch
+            else:
+                traj, current_position, meanvarmarker_map, batch_weights = batch
+                initial_heading_velocity = None
             model_device = next(model.parameters()).device
             traj = traj.to(model_device, non_blocking=True)
             current_position = current_position.to(model_device, non_blocking=True)
             meanvarmarker_map = meanvarmarker_map.to(model_device, non_blocking=True)
+            if initial_heading_velocity is not None:
+                initial_heading_velocity = initial_heading_velocity.to(model_device, non_blocking=True)
             batch_weights = batch_weights.to(model_device, non_blocking=True)
 
             t = torch.randint(0, diffusion.T, (traj.shape[0],), device=traj.device).long()
@@ -157,34 +230,50 @@ def train_from_checkpoint(
                 t,
                 meanvarmarker_map,
                 current_position,
+                initial_heading_velocity,
                 weights=batch_weights,
             )
             loss_vals.append(loss.item())
+            batch_size = traj.shape[0]
+            epoch_loss_sum += loss.item() * batch_size
+            epoch_sample_count += batch_size
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), diffusion.GRAD_CLIP_NORM)
             optimizer.step()
 
             if step % 100 == 0:
                 print(f"Step {step}, Loss: {loss.item():.4f}", flush=True)
+
+        epoch_train_loss = epoch_loss_sum / max(epoch_sample_count, 1)
+        epoch_train_loss_vals.append(epoch_train_loss)
+        epoch_steps.append((epoch + 1) * len(dataloader))
 
         if (epoch + 1) % save_every == 0:
             checkpoint = {
                 "epoch": epoch + 1,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "loss": loss.item(),
+                "epoch_train_loss": epoch_train_loss,
             }
             output_path = diffusion.CHECKPOINT_DIR / f"sparse_trans_waypoints_epoch_{epoch + 1}.pth"
             torch.save(checkpoint, output_path)
             print(f"Checkpoint saved: {output_path}", flush=True)
 
-        val_loss = diffusion.evaluate(model, val_dataloader)
+        val_loss = evaluate(model, val_dataloader)
         val_loss_vals.append(val_loss)
         val_steps.append((epoch + 1) * len(dataloader))
         print(f"Epoch {epoch + 1} held-out validation loss: {val_loss:.6f}", flush=True)
 
-        print(f"Epoch {epoch + 1} complete", flush=True)
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(
+            f"Epoch {epoch + 1} complete, train_loss={epoch_train_loss:.6f}, lr={current_lr:.6f}",
+            flush=True,
+        )
 
     if loss_vals:
         loss_plot_path = diffusion.PLOT_DIR / f"sparse_trans_continue_loss_epoch_{target_epochs}.png"
@@ -204,6 +293,18 @@ def train_from_checkpoint(
         plt.savefig(loss_plot_path, dpi=150, bbox_inches="tight")
         plt.close()
         print(f"Saved continued loss plot to {loss_plot_path}", flush=True)
+
+    if epoch_train_loss_vals:
+        epoch_loss_plot_path = diffusion.PLOT_DIR / f"sparse_trans_continue_epoch_loss_epoch_{target_epochs}.png"
+        plt.figure()
+        plt.plot(epoch_steps, epoch_train_loss_vals, marker="o", label="Epoch-average continued training loss")
+        plt.xlabel("Training Step")
+        plt.ylabel("Loss")
+        plt.title("SparseTrans continued epoch-average training loss")
+        plt.legend()
+        plt.savefig(epoch_loss_plot_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"Saved continued epoch loss plot to {epoch_loss_plot_path}", flush=True)
 
     if val_loss_vals:
         val_plot_path = diffusion.PLOT_DIR / f"sparse_trans_continue_validation_loss_epoch_{target_epochs}.png"
@@ -236,9 +337,18 @@ def parse_args():
         help="Final epoch number to train to, not additional epochs.",
     )
     parser.add_argument("--batch-size", type=int, default=diffusion.BATCH_SIZE)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=diffusion.LR)
     parser.add_argument("--weight-decay", type=float, default=diffusion.WEIGHT_DECAY)
-    parser.add_argument("--save-every", type=int, default=10)
+    parser.add_argument("--save-every", type=int, default=100)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help=(
+            "DataLoader worker count. Defaults to SLURM_CPUS_PER_TASK when set, "
+            "otherwise 2 on CUDA and 0 on CPU."
+        ),
+    )
     parser.add_argument(
         "--reset-optimizer",
         action="store_true",
@@ -257,4 +367,5 @@ if __name__ == "__main__":
         weight_decay=args.weight_decay,
         save_every=args.save_every,
         reset_optimizer=args.reset_optimizer,
+        num_workers=args.num_workers,
     )

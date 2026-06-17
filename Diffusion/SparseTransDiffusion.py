@@ -25,6 +25,9 @@ CHECKPOINT_DIR.mkdir(exist_ok=True)
 PLOT_DIR = SCRIPT_DIR / "plots"
 PLOT_DIR.mkdir(exist_ok=True)
 
+
+#THIS COPY - BATCH_SIZE 128 + K=2 DATASET + SMALLER TOKENIZATION, MLP RATIO + SPLINE LOSS TERM. K1 MODEL CAN'T HAVE WEIGHTED LOSS
+
 """
 HOW TO RUN THIS FILE:
 
@@ -59,7 +62,7 @@ Train() runs the loop over all training data that fit in the index range. The fl
 - control waypoints are normalized to [-1, 1]
 """
 
-EPOCHS = 600
+EPOCHS = 2000
 BATCH_SIZE = 256
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_COORDS = 2
@@ -70,9 +73,10 @@ LR = 3e-4
 WEIGHT_DECAY = 1e-4
 GRAD_CLIP_NORM = 1.0
 MIN_LR = 1e-5
-INDEX = 1000
+INDEX = -1
 CAPTURE_MAP_TOKENS = False
-
+MLP_RATIO = 2
+TOKEN_SPATIAL_DISC = 12
 
 
 def cosine_beta_schedule(timesteps, s=0.008):
@@ -101,7 +105,7 @@ def forward_diffusion_sample(x_0, t):
 
 
 #FORWARD PROCESS HYPERPARAM
-T = 70
+T = 30
 betas = cosine_beta_schedule(timesteps=T)
 alphas = 1.0 - betas
 alphas_cumprod = torch.cumprod(alphas, axis=0)
@@ -113,7 +117,7 @@ posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod
 
 
 data_dict = torch.load(
-    SCRIPT_DIR / "CMAES_currentstack_beamsearch_dataset.pt"
+    SCRIPT_DIR / "CMAES_beamsearch_dataset_dynamic_01_59.pt"
 )
 dense_trajectories = data_dict["trajectories"].float()
 control_waypoints = data_dict["control_waypoints"].float()
@@ -187,6 +191,26 @@ else:
         "Expected control_waypoints shape [B, 2, 8] or [B, 8, 2], "
         f"got {tuple(control_waypoints.shape)}"
     )
+
+if "initial_heading_velocity" in data_dict:
+    raw_initial_heading_velocity = data_dict["initial_heading_velocity"].float()
+else:
+    raw_initial_heading_velocity = trajectories[:, :, 1] - trajectories[:, :, 0]
+
+if raw_initial_heading_velocity.shape != raw_current_positions.shape:
+    raise ValueError(
+        "Expected initial_heading_velocity shape to match current_position "
+        f"{tuple(raw_current_positions.shape)}, got {tuple(raw_initial_heading_velocity.shape)}"
+    )
+
+current_position_is_normalized = (
+    raw_current_positions.min().item() >= -1.5
+    and raw_current_positions.max().item() <= 1.5
+)
+if current_position_is_normalized:
+    initial_heading_velocities = raw_initial_heading_velocity
+else:
+    initial_heading_velocities = raw_initial_heading_velocity * (2.0 / SCALE_FACTOR)
 
 trajectories = (trajectories / SCALE_FACTOR) * 2.0 - 1.0
 
@@ -366,6 +390,7 @@ meanvarmarkermaps = torch.stack([means, vars, one_hot_current_positions.squeeze(
 if INDEX is not None and INDEX > 0:
     trajectories = trajectories[:INDEX]
     conditions = conditions[:INDEX]
+    initial_heading_velocities = initial_heading_velocities[:INDEX]
     means = means[:INDEX]
     vars = vars[:INDEX]
     rmsedrop = rmsedrop[:INDEX]
@@ -376,12 +401,20 @@ if INDEX is not None and INDEX > 0:
 
 
 class TrajectoryDataset(Dataset):
-    def __init__(self, trajectories, weights, meanvarmarkermaps = meanvarmarkermaps, conditions=None):
+    def __init__(
+        self,
+        trajectories,
+        weights,
+        meanvarmarkermaps=meanvarmarkermaps,
+        conditions=None,
+        initial_heading_velocities=None,
+    ):
         self.trajectories = trajectories
         self.weights = weights
         self.rmsedrop = rmsedrop
         self.conditions = conditions
         self.meanvarmarkermaps = meanvarmarkermaps
+        self.initial_heading_velocities = initial_heading_velocities
 
     def __len__(self):
         return len(self.trajectories)
@@ -389,7 +422,17 @@ class TrajectoryDataset(Dataset):
     def __getitem__(self, idx):
         if self.conditions is None:
             return self.trajectories[idx]
-        return self.trajectories[idx], self.conditions[idx], self.meanvarmarkermaps[idx], self.weights[idx]
+        if self.initial_heading_velocities is None:
+            initial_heading_velocity = torch.zeros_like(self.conditions[idx])
+        else:
+            initial_heading_velocity = self.initial_heading_velocities[idx]
+        return (
+            self.trajectories[idx],
+            self.conditions[idx],
+            self.meanvarmarkermaps[idx],
+            initial_heading_velocity,
+            self.weights[idx],
+        )
 
 
 def build_map_id_split(val_count=2):
@@ -531,37 +574,19 @@ class MeanVarMarkerCNN(nn.Module):
         self.pool1 = nn.MaxPool2d(kernel_size=2) # (B, 64, 51, 51) -> (B, 64, 25, 25)
         self.conv2 = nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim * 2, kernel_size=3, padding=1) # (B, 64, 25, 25) -> (B, 128, 25, 25)
         self.act2 = nn.SiLU()   
-        self.pool2 = nn.MaxPool2d(kernel_size=2) # (B, 128, 25, 25) -> (B, 128, 12, 12)
+        self.pool2 = nn.AdaptiveAvgPool2d((TOKEN_SPATIAL_DISC, TOKEN_SPATIAL_DISC)) # (B, 128, 25, 25) -> (B, 128, 12, 12)
         self.token_proj = nn.Linear(hidden_dim * 2, token_dim) #(B, 144, 128) -> (B, 144, 128)
         self.token_norm = nn.LayerNorm(token_dim)
         self.spatial_embedding = SpatialSinusoidalPositionEmbeddings2D(token_dim)
         self.final_norm = nn.LayerNorm(token_dim)
 
 
-
-        # self.conv3 = nn.Conv2d(in_channels=hidden_dim * 2, out_channels=hidden_dim * 2, kernel_size=3, padding=1)
-        # self.act3 = nn.SiLU()
-        # self.pool3 = nn.AdaptiveAvgPool2d((12, 12))
-        # self.flatten = nn.Flatten()
-        # self.pos_mlp = nn.Sequential(
-        #     nn.Linear(2, pos_hidden_dim),
-        #     nn.SiLU(),
-        #     nn.Linear(pos_hidden_dim, pos_hidden_dim),
-        #     nn.SiLU(),
-        # )
-        # self.fc = nn.Sequential(
-        #     nn.Linear(hidden_dim * 2 * 12 * 12 + pos_hidden_dim, 256),
-        #     nn.SiLU(),
-        #     nn.LayerNorm(256),
-        #     nn.Linear(256, output_dim),
-        # )
-
     def forward(self, x, current_position=None):
         x = self.pool1(self.act1(self.conv1(x)))
         x = self.pool2(self.act2(self.conv2(x)))
 
         _, _, height, width = x.shape
-        map_tokens = torch.flatten(x, start_dim=2).transpose(1, 2)  # [B, Height*Width, channels]
+        map_tokens = torch.flatten(x, start_dim=2).transpose(1, 2)  # [B, Height*Width, channels] [B, 144, 128]
         map_tokens = self.token_proj(map_tokens) # project to token_dim
         map_tokens = self.token_norm(map_tokens) # normalize across token_dim for each token
         map_tokens = map_tokens + self.spatial_embedding(
@@ -636,8 +661,9 @@ class WPTokenization(nn.Module):
         )
         self.final_norm = nn.LayerNorm(token_dim)
         self.current_pos_mlp = nn.Sequential(nn.Linear(2, token_dim), nn.SiLU(), nn.Linear(token_dim, token_dim))
+        self.heading_mlp = nn.Sequential(nn.Linear(2, token_dim), nn.SiLU(), nn.Linear(token_dim, token_dim))
 
-    def forward(self, x, t, current_position): 
+    def forward(self, x, t, current_position, initial_heading_velocity=None): 
         """
         x: [B, 2, 8]
         returns: [B, 8, token_dim], one token per waypoint.
@@ -658,8 +684,18 @@ class WPTokenization(nn.Module):
         current_pos_tokens = self.current_pos_mlp(current_position) # [B, token_dim]
         current_pos_tokens = current_pos_tokens.unsqueeze(1) # [B, 1, token_dim]
 
+        if initial_heading_velocity is None:
+            initial_heading_velocity = torch.zeros_like(current_position)
+        initial_heading_velocity = initial_heading_velocity.to(
+            device=current_position.device,
+            dtype=current_position.dtype,
+        )
+        heading_tokens = self.heading_mlp(initial_heading_velocity) # [B, token_dim]
+        heading_tokens = heading_tokens.unsqueeze(1) # [B, 1, token_dim]
+
         waypoint_tokens = waypoint_tokens + time_tokens # add timestep embedding to each waypoint token
         waypoint_tokens = waypoint_tokens + current_pos_tokens # add current position embedding to each waypoint token
+        waypoint_tokens = waypoint_tokens + heading_tokens # add initial heading velocity embedding to each waypoint token
 
         waypoint_tokens = self.final_norm(waypoint_tokens) # normalize across token_dim for each token
         
@@ -744,7 +780,7 @@ class WPMapCrossAttention(nn.Module):
 
 
 class SparseTransAttentionBlock(nn.Module):
-    def __init__(self, token_dim, num_heads = 4, mlp_ratio = 4, dropout = 0.0):
+    def __init__(self, token_dim, num_heads = 4, mlp_ratio = 2, dropout = 0.0):
         super().__init__()
         self.self_attn = WPSelfAttention(token_dim, num_heads, mlp_ratio, dropout)
         self.cross_attn = WPMapCrossAttention(token_dim, num_heads, mlp_ratio, dropout)
@@ -790,26 +826,31 @@ class SparseTransAttentionBlock(nn.Module):
 
 
 class NoisePredictor(nn.Module):
-    def __init__(self, token_dim=256, base_channels=64, num_blocks=3):
+    def __init__(self, token_dim=128, base_channels=64, num_blocks=2):
         super().__init__()
         self.mean_var_marker_cnn = MeanVarMarkerCNN(input_channels=3, hidden_dim=base_channels, token_dim=token_dim)
         self.wp_tokenization = WPTokenization(token_dim)
         self.attention_blocks = nn.ModuleList(
             [
-                SparseTransAttentionBlock(token_dim, num_heads=4, mlp_ratio=4, dropout=0.1)
+                SparseTransAttentionBlock(token_dim, num_heads=4, mlp_ratio=MLP_RATIO, dropout=0.0)
                 for _ in range(num_blocks)
             ] #remember lol
         )
 
 
-        self.output = nn.Linear(token_dim, 2)
+        self.output = nn.Sequential(
+            nn.LayerNorm(token_dim),
+            nn.Linear(token_dim, token_dim),
+            nn.SiLU(),
+            nn.Linear(token_dim, 2),
+        )
         # nn.init.normal_(self.output.weight, mean=0.0, std=1e-3)
         # nn.init.zeros_(self.output.bias)
 
 
-    def forward(self, x, t, meanvarmarker_map, current_position=None):
-        map_tokens = self.mean_var_marker_cnn(meanvarmarker_map) # [B, 144, token_dim]
-        wp_tokens = self.wp_tokenization(x, t, current_position) # [B, 8, token_dim]
+    def forward(self, x, t, meanvarmarker_map, current_position=None, initial_heading_velocity=None):
+        map_tokens = self.mean_var_marker_cnn(meanvarmarker_map) # [B, 64, token_dim]
+        wp_tokens = self.wp_tokenization(x, t, current_position, initial_heading_velocity) # [B, 8, token_dim]
         for attention_block in self.attention_blocks:
             wp_tokens = attention_block(wp_tokens, map_tokens) # [B, 8, token_dim]
         noise_pred = self.output(wp_tokens) # [B, 8, 2]
@@ -833,28 +874,47 @@ def remap_legacy_state_dict_keys(state_dict):
 
 
 
-def get_loss(model, x_0, t, meanvarmarker_map, current_position, weights, alpha=0.1):
+def get_loss(
+    model,
+    x_0,
+    t,
+    meanvarmarker_map,
+    current_position,
+    initial_heading_velocity=None,
+    weights=None,
+    alpha=0.1,
+):
     waypoints_noisy, noise = forward_diffusion_sample(x_0, t) 
+    if weights is None:
+        weights = torch.ones(x_0.shape[0], device=x_0.device, dtype=x_0.dtype)
     with torch.autocast(
         device_type="cuda",
         dtype=torch.bfloat16,
         enabled=waypoints_noisy.is_cuda,
     ):
-        noise_pred = model(waypoints_noisy, t, meanvarmarker_map, current_position)
+        noise_pred = model(
+            waypoints_noisy,
+            t,
+            meanvarmarker_map,
+            current_position,
+            initial_heading_velocity,
+        )
     noise_pred = noise_pred.float()
 
     waypoint_loss = (noise_pred - noise).pow(2).mean(dim=[1, 2])
 
 
-    # traj_noise_pred = pytorch_cubic_spline(noise_pred, current_position)
-    # traj_noise_true = pytorch_cubic_spline(noise, current_position)
+    traj_noise_pred = pytorch_cubic_spline(noise_pred, current_position)
+    traj_noise_true = pytorch_cubic_spline(noise, current_position)
 
 
-    # spline_loss = (traj_noise_pred - traj_noise_true).pow(2).mean(dim=[1, 2])
+    spline_loss = (traj_noise_pred - traj_noise_true).pow(2).mean(dim=[1, 2])
 
-    # per_sample_loss = waypoint_loss + alpha * spline_loss
-    per_sample_loss = waypoint_loss
-    return (per_sample_loss * weights).sum() / (weights.sum() + 1e-6)
+    per_sample_loss = waypoint_loss + alpha * spline_loss
+#    per_sample_loss = waypoint_loss
+    
+#    return (per_sample_loss * weights).sum() / (weights.sum() + 1e-6)
+    return per_sample_loss.mean()
 
 
 # @torch.no_grad()
@@ -876,7 +936,15 @@ def get_loss(model, x_0, t, meanvarmarker_map, current_position, weights, alpha=
 
 
 @torch.no_grad()
-def ddim_sample_timestep(x, t, t_prev, meanvarmarker_map, current_position, clip_x0=False):
+def ddim_sample_timestep(
+    x,
+    t,
+    t_prev,
+    meanvarmarker_map,
+    current_position,
+    initial_heading_velocity=None,
+    clip_x0=False,
+):
     if meanvarmarker_map.shape[1] != 3:
         raise ValueError(
             f"Expected meanvarmarker_map with 3 channels, got {tuple(meanvarmarker_map.shape)}"
@@ -885,7 +953,7 @@ def ddim_sample_timestep(x, t, t_prev, meanvarmarker_map, current_position, clip
     sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
     sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alpha_bar_t)
 
-    noise_pred = model(x, t, meanvarmarker_map, current_position)
+    noise_pred = model(x, t, meanvarmarker_map, current_position, initial_heading_velocity)
     x0_pred = (x - sqrt_one_minus_alpha_bar_t * noise_pred) / sqrt_alpha_bar_t
     if clip_x0:
         x0_pred = x0_pred.clamp(-1.0, 1.0)
@@ -901,7 +969,14 @@ def ddim_sample_timestep(x, t, t_prev, meanvarmarker_map, current_position, clip
     return x_prev
 
 @torch.no_grad()
-def ddim_sample(initial_noise, meanvarmarker_map, current_position, num_steps=None, clip_x0=False):
+def ddim_sample(
+    initial_noise,
+    meanvarmarker_map,
+    current_position,
+    initial_heading_velocity=None,
+    num_steps=None,
+    clip_x0=False,
+):
     if meanvarmarker_map.shape[1] != 3:
         raise ValueError(
             f"Expected meanvarmarker_map with 3 channels, got {tuple(meanvarmarker_map.shape)}"
@@ -916,7 +991,15 @@ def ddim_sample(initial_noise, meanvarmarker_map, current_position, num_steps=No
         prev_i = schedule[step_idx + 1] if step_idx + 1 < len(schedule) else -1
         t = torch.full((x.shape[0],), i, dtype=torch.long, device=x.device)
         t_prev = torch.full((x.shape[0],), prev_i, dtype=torch.long, device=x.device)
-        x = ddim_sample_timestep(x, t, t_prev, meanvarmarker_map, current_position, clip_x0=clip_x0)
+        x = ddim_sample_timestep(
+            x,
+            t,
+            t_prev,
+            meanvarmarker_map,
+            current_position,
+            initial_heading_velocity,
+            clip_x0=clip_x0,
+        )
     return x
 
 
@@ -926,11 +1009,12 @@ def sample_plot_traj(output_path=None):
     traj = torch.randn((1, *TARGET_SHAPE), device=next(model.parameters()).device)
     meanvarmarker_map = meanvarmarkermaps[0:1].to(next(model.parameters()).device)
     current_position = conditions[0:1].to(next(model.parameters()).device)
+    initial_heading_velocity = initial_heading_velocities[0:1].to(next(model.parameters()).device)
     plt.figure(figsize=(6, 6))
     plt.axis("equal")
     plt.grid(True)
 
-    traj = ddim_sample(traj, meanvarmarker_map, current_position)
+    traj = ddim_sample(traj, meanvarmarker_map, current_position, initial_heading_velocity)
 
     traj_to_plot = extract_control_waypoints(traj[0].cpu())
     #.clamp(0.0, SCALE_FACTOR)
@@ -953,16 +1037,26 @@ def train_one_sample(model, steps=3000, batch_size=64):
 
     x0 = trajectories[:1].to(device)
     pos0 = conditions[:1].to(device)
+    heading0 = initial_heading_velocities[:1].to(device)
     meanvarmarker_map = meanvarmarkermaps[:1].to(device)
 
     for step in range(steps):
         traj = x0.repeat(batch_size, 1, 1)
         current_position = pos0.repeat(batch_size, 1)
+        initial_heading_velocity = heading0.repeat(batch_size, 1)
         batch_meanvarmarker_map = meanvarmarker_map.repeat(batch_size, 1, 1, 1)
         batch_weights = torch.ones(batch_size, device=device)
 
         t = torch.randint(0, T, (batch_size,), device=device).long()
-        loss = get_loss(model, traj, t, batch_meanvarmarker_map, current_position, weights=batch_weights)
+        loss = get_loss(
+            model,
+            traj,
+            t,
+            batch_meanvarmarker_map,
+            current_position,
+            initial_heading_velocity,
+            weights=batch_weights,
+        )
         losses.append(loss.item())
 
         optimizer.zero_grad()
@@ -999,13 +1093,27 @@ def evaluate(model, dataloader):
     model_device = next(model.parameters()).device
 
     for batch in dataloader:
-        traj, current_position, meanvarmarker_map, batch_weights = batch
+        if len(batch) == 5:
+            traj, current_position, meanvarmarker_map, initial_heading_velocity, batch_weights = batch
+        else:
+            traj, current_position, meanvarmarker_map, batch_weights = batch
+            initial_heading_velocity = None
         traj = traj.to(model_device, non_blocking=True)
         current_position = current_position.to(model_device, non_blocking=True)
         meanvarmarker_map = meanvarmarker_map.to(model_device, non_blocking=True)
+        if initial_heading_velocity is not None:
+            initial_heading_velocity = initial_heading_velocity.to(model_device, non_blocking=True)
         batch_weights = batch_weights.to(model_device, non_blocking=True)
         t = torch.randint(0, T, (traj.shape[0],), device=traj.device).long()
-        loss = get_loss(model, traj, t, meanvarmarker_map, current_position, weights=batch_weights)
+        loss = get_loss(
+            model,
+            traj,
+            t,
+            meanvarmarker_map,
+            current_position,
+            initial_heading_velocity,
+            weights=batch_weights,
+        )
         batch_weight_sum = batch_weights.sum().item()
         weighted_loss_sum += loss.item() * batch_weight_sum
         total_weight += batch_weight_sum
@@ -1023,7 +1131,7 @@ def train(
     dataloader,
     epochs,
     betas=betas,
-    lr=1e-3,
+    lr=LR,
     save_every=100,
     val_dataloader=None,
 ):
@@ -1043,15 +1151,29 @@ def train(
         epoch_weight_sum = 0.0
         for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             stepcount.append(epoch * len(dataloader) + step)
-            traj, current_position, meanvarmarker_map, batch_weights = batch
+            if len(batch) == 5:
+                traj, current_position, meanvarmarker_map, initial_heading_velocity, batch_weights = batch
+            else:
+                traj, current_position, meanvarmarker_map, batch_weights = batch
+                initial_heading_velocity = None
             model_device = next(model.parameters()).device
             traj = traj.to(model_device, non_blocking=True)
             current_position = current_position.to(model_device, non_blocking=True)
             meanvarmarker_map = meanvarmarker_map.to(model_device, non_blocking=True)
+            if initial_heading_velocity is not None:
+                initial_heading_velocity = initial_heading_velocity.to(model_device, non_blocking=True)
             batch_weights = batch_weights.to(model_device, non_blocking=True)
             batch_size = traj.shape[0]
             t = torch.randint(0, T, (batch_size,), device=traj.device).long()
-            loss = get_loss(model, traj, t, meanvarmarker_map, current_position, weights=batch_weights)
+            loss = get_loss(
+                model,
+                traj,
+                t,
+                meanvarmarker_map,
+                current_position,
+                initial_heading_velocity,
+                weights=batch_weights,
+            )
             loss_vals.append(loss.item())
             batch_weight_sum = batch_weights.sum().item()
             epoch_loss_sum += loss.item() * batch_weight_sum
@@ -1167,7 +1289,7 @@ if __name__ == "__main__":
     dataloader_kwargs = {
         "batch_size": BATCH_SIZE,
         "shuffle": True,
-        "num_workers": 4 if torch.cuda.is_available() else 0,
+        "num_workers": 2 if torch.cuda.is_available() else 0,
         "pin_memory": torch.cuda.is_available(),
     }
     if dataloader_kwargs["num_workers"] > 0:
@@ -1183,12 +1305,14 @@ if __name__ == "__main__":
         weights[train_mask],
         meanvarmarkermaps=meanvarmarkermaps[train_mask],
         conditions=conditions[train_mask],
+        initial_heading_velocities=initial_heading_velocities[train_mask],
     )
     val_dataset = TrajectoryDataset(
         trajectories[val_mask],
         weights[val_mask],
         meanvarmarkermaps=meanvarmarkermaps[val_mask],
         conditions=conditions[val_mask],
+        initial_heading_velocities=initial_heading_velocities[val_mask],
     )
     val_dataloader_kwargs = dict(dataloader_kwargs)
     val_dataloader_kwargs["shuffle"] = False

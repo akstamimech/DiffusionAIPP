@@ -256,7 +256,6 @@ def run_map(selected_map, beta_value):
     executed_since_replan = 0
     global_rmselist = []
     occupied_rmselist = []
-    weighted_rmselist = []
 
     for ts in range(0, timealloted):
         if ts <= 1:
@@ -383,12 +382,12 @@ def run_map(selected_map, beta_value):
             xs=xs,
             ys=ys,
             step=step,
+            utility_threshold=utility_threshold,
             xmin=xmin,
             ymin=ymin,
         )
         global_rmselist.append(reconstruction_metrics["global_rmse"])
         occupied_rmselist.append(reconstruction_metrics["occupied_rmse"])
-        weighted_rmselist.append(reconstruction_metrics["weighted_rmse"])
 
     final_variance = np.sum(np.diag(P))
     variance_delta = initial_total_variance - final_variance
@@ -445,7 +444,6 @@ def run_map(selected_map, beta_value):
 
     global_rmse_time = compute_rmse_time_metrics(global_rmselist)
     occupied_rmse_time = compute_rmse_time_metrics(occupied_rmselist)
-    weighted_rmse_time = compute_rmse_time_metrics(weighted_rmselist)
     print(
         f"Map {selected_map}, beta {beta_value:.1f}: Global RMSE AUC = "
         f"{global_rmse_time['auc_rmse']:.4f}, Mean = {global_rmse_time['mean_rmse']:.4f}"
@@ -453,10 +451,6 @@ def run_map(selected_map, beta_value):
     print(
         f"Map {selected_map}, beta {beta_value:.1f}: Occupied RMSE AUC = "
         f"{occupied_rmse_time['auc_rmse']:.4f}, Mean = {occupied_rmse_time['mean_rmse']:.4f}"
-    )
-    print(
-        f"Map {selected_map}, beta {beta_value:.1f}: Weighted RMSE AUC = "
-        f"{weighted_rmse_time['auc_rmse']:.4f}, Mean = {weighted_rmse_time['mean_rmse']:.4f}"
     )
     chunk_path = save_beta_chunk(selected_map, beta_value, beta_dataset)
 
@@ -468,7 +462,6 @@ def run_map(selected_map, beta_value):
         metrics["task_completion"],
         global_rmse_time["auc_rmse"],
         occupied_rmse_time["auc_rmse"],
-        weighted_rmse_time["auc_rmse"],
         chunk_path,
     )
 
@@ -486,15 +479,15 @@ if __name__ == "__main__":
             map_results.append(result)
 
         best_result = min(map_results, key=lambda item: item[5])
-        selected_chunk_paths.append(best_result[8])
+        selected_chunk_paths.append(best_result[7])
         print(
             f"Map {selected_map}: keeping beta {best_result[1]:.1f} chunk "
             f"with Global RMSE AUC = {best_result[5]:.4f}"
         )
 
         for result in map_results:
-            if result[8] != best_result[8]:
-                delete_chunk(result[8])
+            if result[7] != best_result[7]:
+                delete_chunk(result[7])
 
     print("\nSummary of results:")
     for (
@@ -505,21 +498,19 @@ if __name__ == "__main__":
         completion,
         global_auc,
         occupied_auc,
-        weighted_auc,
         _,
     ) in metriclist:
         print(
             f"Map {map_id}, beta {beta_value:.1f}: Gained Utility = {gained_utility:.4f}, "
             f"Total Utility = {total_utility:.4f}, Task Completion = {completion:.4%}, "
-            f"Global RMSE AUC = {global_auc:.4f}, Occupied RMSE AUC = {occupied_auc:.4f}, "
-            f"Weighted RMSE AUC = {weighted_auc:.4f}"
+            f"Global RMSE AUC = {global_auc:.4f}, Occupied RMSE AUC = {occupied_auc:.4f}"
         )
 
     print("\nAverage global RMSE AUC by beta:")
     for beta_value in beta_values:
         global_aucs = [
             global_auc
-            for _, result_beta, _, _, _, global_auc, _, _, _ in metriclist
+            for _, result_beta, _, _, _, global_auc, _, _ in metriclist
             if np.isclose(result_beta, beta_value)
         ]
         avg_global_auc = np.mean(global_aucs)
