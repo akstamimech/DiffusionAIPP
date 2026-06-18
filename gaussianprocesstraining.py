@@ -12,7 +12,7 @@ from scipy.linalg import block_diag
 from scipy.sparse import csr_matrix, issparse, vstack as sparse_vstack
 
 step = 2.0
-CMA_SEED = 42
+CMA_SEED = 33
 CMA_PREDICTIVE_MAXITER = 8
 CMA_PREDICTIVE_MAXFEVALS = 20
 CMA_PREDICTIVE_POPSIZE = 20
@@ -37,7 +37,7 @@ def resolution_block_size(altitude):
 
 def noise_model(altitude, min_altitude=10.0):
     min_variance = 0.01
-    max_variance = 0.05
+    max_variance = 0.04
     b = np.log(4.0) / 30.0
 
     return min_variance + (max_variance - min_variance) * (
@@ -379,25 +379,16 @@ def build_pyramid_lattice_3d(xs, ys, zmin, zmax, margin=None): ###changing hardc
     low_y = snap_positions(np.linspace(ymin, ymax, 4), ys)
     middle_x = snap_positions(np.linspace(xmin, xmax, 3), xs)
     middle_y = snap_positions(np.linspace(ymin, ymax, 3), ys)
-    # middle_x = snap_positions(
-    #     [xmin + (xmax - xmin) / 3.0, xmin + 2.0 * (xmax - xmin) / 3.0],
-    #     xs,
-    # )
-    # middle_y = snap_positions(
-    #     [ymin + (ymax - ymin) / 3.0, ymin + 2.0 * (ymax - ymin) / 3.0],
-    #     ys,
-    # )
     mt_x = snap_positions(np.linspace(xmin, xmax, 2), xs)
     mt_y = snap_positions(np.linspace(ymin, ymax, 2), ys)
-    top_x = snap_positions(np.linspace(xmin, xmax, 1), xs)
-    top_y = snap_positions(np.linspace(ymin, ymax, 1), ys)
+    top_x = snap_positions([(xmin + xmax) / 2.0], xs)
+    top_y = snap_positions([(ymin + ymax) / 2.0], ys)
 
-    middle_z = (float(zmin) + float(zmax)) / 3.0
-    mt_z = (float(zmin) + float(zmax)) * 2.0 / 3.0
-    top_z = float(zmax)
-    lattice = [(x, y, float(zmin)) for x in low_x for y in low_y]
-    lattice.extend((x, y, middle_z) for x in middle_x for y in middle_y)
-    lattice.extend((x, y, mt_z) for x in mt_x for y in mt_y)
+    z_layers = np.linspace(float(zmin), float(zmax), 4)
+    lattice = [(x, y, float(z_layers[0])) for x in low_x for y in low_y]
+    lattice.extend((x, y, float(z_layers[1])) for x in middle_x for y in middle_y)
+    lattice.extend((x, y, float(z_layers[2])) for x in mt_x for y in mt_y)
+    top_z = float(z_layers[3])
     lattice.append((top_x[0], top_y[0], top_z))
     return list(dict.fromkeys(lattice))
 
@@ -800,6 +791,7 @@ def cma_es_refine_waypoints(
     R=None,
     lateral_coverage=None,
     predictive_variance=False,
+    seed=CMA_SEED,
 ):
     x0 = flatten_waypoints(initial_waypoints)
     sigma0 = 4.0
@@ -824,7 +816,7 @@ def cma_es_refine_waypoints(
         "bounds": [lower_bounds, upper_bounds],
         "maxiter": maxiter,
         "popsize": popsize,
-        "seed": CMA_SEED,
+        "seed": seed,
         "verb_disp": 0,
         "verb_log": 0,
     })
@@ -874,6 +866,7 @@ def cma_es_refine_waypoints_3d(
     maxiter=None,
     popsize=None,
     maxfevals=None,
+    seed=CMA_SEED,
 ):
     margin = step * 2
     xmin, xmax = np.min(xs), np.max(xs)
@@ -906,7 +899,7 @@ def cma_es_refine_waypoints_3d(
         "bounds": [lower_bounds, upper_bounds],
         "maxiter": maxiter,
         "popsize": popsize,
-        "seed": CMA_SEED,
+        "seed": seed,
         "verb_disp": 0,
         "verb_log": 0,
     }
