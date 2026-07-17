@@ -1,7 +1,18 @@
 import numpy as np
+LCB = False
 
-
-def compute_task_completion(pos_history, pts, xs, ys, step, lateral_coverage, xmin=None, ymin=None):
+def compute_task_completion(
+    pos_history,
+    pts,
+    xs,
+    ys,
+    step,
+    lateral_coverage,
+    xmin=None,
+    ymin=None,
+    pose_history=None,
+    angle_of_view=60.0,
+):
     """Compute unique true utility coverage over a rollout.
 
     Args:
@@ -11,6 +22,10 @@ def compute_task_completion(pos_history, pts, xs, ys, step, lateral_coverage, xm
         step: Grid spacing.
         lateral_coverage: Half-width of the square sensor footprint.
         xmin, ymin: Optional grid origin. Defaults to xs.min(), ys.min().
+        pose_history: Optional sequence of sampled poses [(x, y, z), ...].
+            When supplied, altitude determines the square FoV radius and
+            lateral_coverage is ignored.
+        angle_of_view: Sensor angle of view used with pose_history.
 
     Returns:
         dict with gained_true_utility, total_true_utility, task_completion,
@@ -34,9 +49,21 @@ def compute_task_completion(pos_history, pts, xs, ys, step, lateral_coverage, xm
 
     observed_mask = np.zeros_like(true_map, dtype=bool)
 
-    for cx, cy in pos_history:
-        for x in np.arange(cx - lateral_coverage, cx + lateral_coverage + 1e-9, step):
-            for y in np.arange(cy - lateral_coverage, cy + lateral_coverage + 1e-9, step):
+    if pose_history is None:
+        coverage_poses = [
+            (cx, cy, float(lateral_coverage))
+            for cx, cy in pos_history
+        ]
+    else:
+        half_angle = np.deg2rad(angle_of_view) / 2.0
+        coverage_poses = [
+            (cx, cy, float(cz) * np.tan(half_angle))
+            for cx, cy, cz in pose_history
+        ]
+
+    for cx, cy, coverage_radius in coverage_poses:
+        for x in np.arange(cx - coverage_radius, cx + coverage_radius + 1e-9, step):
+            for y in np.arange(cy - coverage_radius, cy + coverage_radius + 1e-9, step):
                 xi = int(round((x - xmin) / step))
                 yi = int(round((y - ymin) / step))
                 if 0 <= xi < len(xs) and 0 <= yi < len(ys):
@@ -100,7 +127,11 @@ def compute_reconstruction_rmse(
     error = mean_map - true_map
     global_rmse = float(np.sqrt(np.mean(error ** 2)))
 
-    occupied_mask = true_map < utility_threshold
+    if LCB == True: 
+        occupied_mask = true_map <= utility_threshold
+    
+    elif LCB == False:
+        occupied_mask = true_map >= utility_threshold
     if np.any(occupied_mask):
         occupied_rmse = float(np.sqrt(np.mean(error[occupied_mask] ** 2)))
     else:

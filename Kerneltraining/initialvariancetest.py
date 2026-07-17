@@ -15,7 +15,7 @@ Xg, Yg = np.meshgrid(xs, ys)
 X_test = np.column_stack([Xg.ravel(), Yg.ravel()])
 
 # Learned kernel
-kernel = 0.101**2 * Matern(length_scale=4.79, nu=1.5)
+kernel = 0.109**2 * Matern(length_scale=4.79, nu=1.5)
 
 # Prior covariance
 P = kernel(X_test)

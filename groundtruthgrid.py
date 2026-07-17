@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import csv
 
-dataset_id_range = 1000
+dataset_id_range = 200
 path = r"C:\Users\Aksha\OneDrive\Year 6\Thesis\scripts\csv"
 for id in range(0, dataset_id_range + 1):
 

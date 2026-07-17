@@ -5,12 +5,12 @@ import csv
 
 
 
-number_of_maps = 1000
+number_of_maps = 200
 fulllist = []
-number_of_focii = 10
-plantradius = 2
-intensity = 1000
-how_concentrated = 15
+number_of_focii = 20
+plantradius = 1
+intensity = 200
+how_concentrated = 7
 
 path = r"C:\Users\Aksha\OneDrive\Year 6\Thesis\scripts\csv"
 
@@ -87,14 +87,26 @@ for map in range(number_of_maps + 1):
         writer.writerow(["map", "x", "y"])
 
         assetposlist = []
-        number_of_blobs = np.random.randint(2, 5)
-        gaussian_centers = [
-            [np.random.uniform(10, 90), np.random.uniform(10, 90)]
-            for _ in range(number_of_blobs)
-        ]
+        # Multimodal expert paths need SEVERAL EQUAL, WELL-SEPARATED targets so the ORDER the
+        # planner visits them in is a genuine free choice (many paths -> same variance reduction).
+        # Two simple properties do it:
+        #   (a) few blobs (not a dense mass), each with the SAME point count -> no dominant blob
+        #       that the planner would always resolve first, and
+        #   (b) a minimum spacing between blob centres -> distinct, separated targets rather than
+        #       one merged region, so "which target next" stays a real choice at every step.
+        number_of_blobs = np.random.randint(3, 6)  # 3-5 distinct targets
+        min_separation = 25.0                      # keep centres this far apart (map units)
+        gaussian_centers = []
+        attempts = 0
+        while len(gaussian_centers) < number_of_blobs and attempts < 1000:
+            attempts += 1
+            candidate = [np.random.uniform(15, 85), np.random.uniform(15, 85)]
+            if all(np.hypot(candidate[0] - cx, candidate[1] - cy) >= min_separation
+                   for cx, cy in gaussian_centers):
+                gaussian_centers.append(candidate)
 
         for center in gaussian_centers:
-            for _ in range(intensity):
+            for _ in range(intensity):  # SAME intensity for every blob => equal-value targets
                 x, y = sample_centre(centre=center)
                 assetposlist.append([x, y])
 
@@ -115,26 +127,26 @@ for map in range(number_of_maps + 1):
 
     
 
-# fig, ax = plt.subplots()
+fig, ax = plt.subplots()
 
-# for x, y in assetposlist:
-#     circle = Circle((x,y), radius = plantradius, alpha = 0.5)
-#     ax.add_patch(circle)
+for x, y in assetposlist:
+    circle = Circle((x,y), radius = plantradius, alpha = 0.5)
+    ax.add_patch(circle)
 
 
-# # # ax.scatter([x for x, y in gaussianfocus],
-# # #            [y for x, y in gaussianfocus],
-# # #            marker='x', s=100)
+# # ax.scatter([x for x, y in gaussianfocus],
+# #            [y for x, y in gaussianfocus],
+# #            marker='x', s=100)
 
-# ax.set_xlim(0, 100)
-# ax.set_ylim(0, 100)
-# ax.set_aspect('equal') 
+ax.set_xlim(0, 100)
+ax.set_ylim(0, 100)
+ax.set_aspect('equal') 
 
-# ax.set_xlabel("meters")
-# ax.set_ylabel("meters")
+ax.set_xlabel("meters")
+ax.set_ylabel("meters")
 
-# plt.show()
+plt.show()
 
-# # plt.scatter([assetcoord[0] for assetcoord in assetposlist], [assetcoord[1] for assetcoord in assetposlist])
-# # plt.scatter([focii[0] for focii in gaussianfocus], [focii[1] for focii in gaussianfocus])
-# plt.show()
+# plt.scatter([assetcoord[0] for assetcoord in assetposlist], [assetcoord[1] for assetcoord in assetposlist])
+# plt.scatter([focii[0] for focii in gaussianfocus], [focii[1] for focii in gaussianfocus])
+plt.show()

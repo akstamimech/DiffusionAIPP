@@ -12,22 +12,38 @@ from gaussianprocesstraining import utility_function, sampler, create_plots_and_
 from gaussianprocesstraining import build_sensor_matrix, fov_grid_points, fov_lateral_radius, noise_model
 from evalmetrics import compute_task_completion, compute_reconstruction_rmse, compute_rmse_time_metrics
 import torch
+import time
 
 
 step = 2.0
-timealloted = 150
+timealloted = 200
 #beta, alpha, are just for vizualisation. utility is for GP
 beta = 1.5
 alpha = 1.0
 utility_threshold = 0.3
 planning_horizon = 8
 action_horizon = 3  # this is more like replanning horizon
-selected_map = int(os.environ.get("SELECTED_MAP", 17))
+selected_map = int(os.environ.get("SELECTED_MAP", 46))
 lateral_coverage = step * 2
 SENSORNOISE_SEED = 123
-rng = np.random.default_rng(SENSORNOISE_SEED + selected_map)
 MAPTYPE = os.environ.get("MAPTYPE", "NAIP") #choose between "multiblob" and "halffield" or "blob" or "(nothing)" or "NAIP"
 INIT_ALTITUDE = 10
+WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "90"))  # <=0 = unconstrained (timestep
+                                                                      # loop runs to completion); otherwise
+                                                                      # the flight ends at timealloted
+                                                                      # timesteps OR this many real
+                                                                      # seconds, whichever comes first
+
+# Each simulation step is 1 vector step, treated as 1 meter of real flight. At
+# a flight speed of FLIGHT_SPEED_MPS, that step physically takes at least
+# STEP_DISTANCE_METERS / FLIGHT_SPEED_MPS seconds. When ENFORCE_MIN_STEP_TIME
+# is on, a step that computed (dynamics + sensor update) faster than that gets
+# padded with a sleep up to the floor; a step that already took longer is left
+# alone - this is a floor, not a fixed duration.
+ENFORCE_MIN_STEP_TIME = os.environ.get("ENFORCE_MIN_STEP_TIME", "1") == "1"
+STEP_DISTANCE_METERS = 1.0
+FLIGHT_SPEED_MPS = 3.0
+MIN_STEP_SECONDS = STEP_DISTANCE_METERS / FLIGHT_SPEED_MPS
 
 
 """
@@ -149,6 +165,8 @@ if __name__ == "__main__":
         if idx.size > 0:
             true_map_flat[idx[0]] = value
 
+    rng = np.random.default_rng(SENSORNOISE_SEED + selected_map)
+
     # mean = np.full(X_test.shape[0], utility_threshold)
     mu = np.full_like(mean, utility_threshold - 0.1, dtype = np.float32)
     P = cov.copy()
@@ -183,14 +201,33 @@ if __name__ == "__main__":
     sorted_util_values_list.append(grid_search(X, Y, cx, cy, [initial_utility]))
 
     initial_total_variance = np.sum(np.diag(P))
-    print(f"Initial total variance: {initial_total_variance:.4f}")
+    print(f"Map {selected_map}: Initial total variance: {initial_total_variance:.4f}")
 
     utility = initial_utility
 
     rmselist = []
     global_rmselist = []
+    wall_time_history = []
+
+    # WALLCLOCK_SECONDS<=0 means unconstrained: the loop below only ever stops
+    # because ts reached timealloted. Otherwise this flight ends either when
+    # the timestep loop naturally finishes or when WALLCLOCK_SECONDS of real
+    # time have elapsed since the flight started, whichever comes first.
+    unconstrained = WALLCLOCK_SECONDS <= 0
+    flight_start_time = time.time()
+    stopped_early = False
 
     for ts in range(0, timealloted):
+        if not unconstrained and (time.time() - flight_start_time) >= WALLCLOCK_SECONDS:
+            stopped_early = True
+            print(
+                f"Map {selected_map}: wall-clock budget reached at timestep {ts} "
+                f"(of {timealloted}); ending the flight early."
+            )
+            break
+
+        step_start_time = time.time()
+
         if ts <= 1:
             grad_x, grad_y, waypoint_reached = waypoint(cx, cy, goal_x=80.0, goal_y=80.0, step=step)
             cx, cy = dynamics(cx, cy, grad_x, grad_y, step, samplestep, xmin, xmax, ymin, ymax)
@@ -223,7 +260,7 @@ if __name__ == "__main__":
                 else:
                     grad_x, grad_y = 0.0, 0.0
 
-        
+
 
             cx, cy = dynamics(cx, cy, grad_x, grad_y, step, samplestep, xmin, xmax, ymin, ymax)
             pos_history.append((cx, cy))
@@ -264,30 +301,83 @@ if __name__ == "__main__":
 
         rmselist.append(reconstruction_metrics["occupied_rmse"])
         global_rmselist.append(reconstruction_metrics["global_rmse"])
+        if ENFORCE_MIN_STEP_TIME:
+            step_elapsed = time.time() - step_start_time
+            if step_elapsed < MIN_STEP_SECONDS:
+                time.sleep(MIN_STEP_SECONDS - step_elapsed)
 
-    rmse_trace = np.column_stack([global_rmselist, rmselist])
+        wall_time_history.append(time.time() - flight_start_time)
+
+    if not rmselist:
+        raise SystemExit(
+            f"Map {selected_map}: WALLCLOCK_SECONDS={WALLCLOCK_SECONDS} was too small "
+            f"for even one timestep to complete; nothing to plot or save."
+        )
+
+    timestep_index = np.asarray(step_numbers[1:], dtype=int)
+    wall_time_arr = np.asarray(wall_time_history, dtype=float)
+    variancelist = [np.sum(np.diag(P)) for P in P_history]
+    variance_per_step = np.asarray(variancelist[1:], dtype=float)
+
+    metrics_trace = np.column_stack(
+        [timestep_index, wall_time_arr, global_rmselist, rmselist, variance_per_step]
+    )
     np.savetxt(
         output_dir / f"map_{selected_map}_rmse_over_time.csv",
-        rmse_trace,
+        metrics_trace,
         delimiter=",",
-        header="global_rmse,occupied_rmse",
+        header="timestep,wall_time_seconds,global_rmse,occupied_rmse,global_variance",
         comments="",
     )
 
     plt.figure()
-    plt.plot(global_rmselist, label="Global RMSE")
-    plt.plot(rmselist, label="Occupied RMSE")
+    plt.plot(timestep_index, global_rmselist, label="Global RMSE")
+    plt.plot(timestep_index, rmselist, label="Occupied RMSE")
     plt.xlabel("Timestep")
     plt.ylabel("RMSE")
-    plt.title(f"Map {selected_map} - RMSE over Time")
+    plt.title(f"Map {selected_map} - RMSE over Timesteps")
     plt.legend()
     plt.savefig(output_dir / f"map_{selected_map}_rmse_over_time.png")
     plt.close()
 
+    plt.figure()
+    plt.plot(wall_time_arr, global_rmselist, label="Global RMSE")
+    plt.plot(wall_time_arr, rmselist, label="Occupied RMSE")
+    plt.xlabel("Wall-clock time (s)")
+    plt.ylabel("RMSE")
+    plt.title(f"Map {selected_map} - RMSE over Wall Time")
+    plt.legend()
+    plt.savefig(output_dir / f"map_{selected_map}_rmse_over_walltime.png")
+    plt.close()
+
+    plt.figure()
+    plt.plot(variancelist, label="Global Variance")
+    plt.xlabel("Timestep")
+    plt.ylabel("Global Variance")
+    plt.title(f"Map {selected_map} - Lawnmower Variance over Timesteps")
+    plt.legend()
+    plt.savefig(output_dir / f"map_{selected_map}_var.png")
+    plt.close()
+
+    plt.figure()
+    plt.plot(wall_time_arr, variance_per_step, label="Global Variance")
+    plt.xlabel("Wall-clock time (s)")
+    plt.ylabel("Global Variance")
+    plt.title(f"Map {selected_map} - Lawnmower Variance over Wall Time")
+    plt.legend()
+    plt.savefig(output_dir / f"map_{selected_map}_var_walltime.png")
+    plt.close()
+
     final_variance = np.sum(np.diag(P))
-    print(f"Final total variance: {final_variance:.4f}")
     variance_delta = initial_total_variance - final_variance
-    print(f"Variance reduction: {variance_delta:.4f}")
+    print(f"Map {selected_map}: Final total variance: {final_variance:.4f}")
+    print(f"Map {selected_map}: Variance reduction: {variance_delta:.4f}")
+    if stopped_early:
+        print(
+            f"Map {selected_map}: flight ended early after "
+            f"{time.time() - flight_start_time:.1f}s due to the wall-clock budget "
+            f"(completed {len(rmselist)} of {timealloted} timesteps)."
+        )
 
     if os.environ.get("SKIP_VIZ", "0") != "1":
         create_plots_and_gifs(

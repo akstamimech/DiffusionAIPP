@@ -8,17 +8,59 @@ from matplotlib.patches import Rectangle
 import cma
 
 from scipy.interpolate import CubicSpline
-from scipy.linalg import block_diag
+from scipy.linalg import block_diag, solve as spd_solve
 from scipy.sparse import csr_matrix, issparse, vstack as sparse_vstack
 
 step = 2.0
-CMA_SEED = 33
-CMA_PREDICTIVE_MAXITER = 8
-CMA_PREDICTIVE_MAXFEVALS = 20
-CMA_PREDICTIVE_POPSIZE = 20
+CMA_SEED = 31
+CMA_PREDICTIVE_MAXITER = 40
+CMA_PREDICTIVE_MAXFEVALS = 1000
+CMA_PREDICTIVE_POPSIZE = 12
+
+# Per-axis initial CMA-ES step sizes for cma_es_refine_waypoints_3d, replacing a
+# single flat sigma0. Following Popovic et al. (2020)'s own step-size tuning
+# methodology (their CMA-ES(x,y,z) sweep against a lattice-only baseline), but
+# scaled to this workspace's larger xy extent (~92m vs their ~30m) and z range
+# (30m vs their ~25m). A flat sigma0=4.0 was an oversized step relative to the
+# 30m z-range specifically, which - as in their own (10,12) case - made CMA-ES
+# perform no better (often worse) than the lattice search it refines; these
+# smaller, per-axis values were swept against the lattice-only baseline on
+# real maps and consistently beat both the flat sigma0=4.0 default and, on
+# most maps/metrics, lattice search alone.
+CMA_STEP_SIZE_XY = 1.5
+CMA_STEP_SIZE_Z = 1.2
+
+# --- grid_search_3d softmax-selection hyperparameters ---
+# grid_search_3d_softmax replaces the per-step hard argmax over candidate
+# waypoints with a softmax sample, so the greedy warm start handed to CMA-ES
+# (and therefore the final refined trajectory) can vary instead of being
+# bit-identical every call.
+GRID_SEARCH_SOFTMAX_TEMPERATURE = 0.2  # 0 -> recovers hardmax/argmax; higher -> more
+                                        # uniform over candidates. Scores are min-max
+                                        # normalized to [0, 1] before scaling by this,
+                                        # so the value is comparable across maps/rounds
+                                        # regardless of the raw gain/distance magnitude.
+GRID_SEARCH_SOFTMAX_SEED = None  # None -> draws from numpy's global RNG state (a
+                                  # different sample every call); set an int for
+                                  # reproducible waypoint sampling.
+
+# --- grid_search_3d tie-break selection hyperparameters ---
+# grid_search_3d_tiebreak replaces the per-step hard argmax with a uniform-random
+# pick among candidates within GRID_SEARCH_TIE_TOLERANCE of the top score, instead
+# of softmax's approach of weighting every candidate (including strictly worse
+# ones). This never trades away score - it only resolves genuine (or
+# near-floating-point) ties, which the plain argmax otherwise always breaks the
+# same way (first candidate in build_pyramid_lattice_3d's fixed generation order).
+GRID_SEARCH_TIE_TOLERANCE = 1e-6  # fraction of (max - min) score spread within
+                                   # this round that counts as "tied" with the top
+                                   # score. Small on purpose - only meant to catch
+                                   # true/near-exact ties, not meaningfully worse
+                                   # candidates.
+GRID_SEARCH_TIEBREAK_SEED = None  # None -> draws from numpy's global RNG state;
+                                   # set an int for reproducible tie-breaking.
 
 
-
+LCB = False
 
 ###FOV FUNCTIONS 
 
@@ -50,14 +92,28 @@ def build_sensor_matrix(fov, cz, xs, ys, return_block_ids=False):
     ny = len(ys)
     block_size = resolution_block_size(cz)
 
-    visible_indices = []
+    if len(fov) == 0:
+        visible_indices = []
+    else:
+        # Callers (compute_fov/fov_grid_points) always build `fov` by filtering
+        # the xs/ys arrays themselves, so every point here already lies exactly
+        # on the (uniformly spaced) grid. Compute the index arithmetically
+        # instead of doing an O(len(xs)) argmin scan per point.
+        fov_arr = np.asarray(fov, dtype=float)
+        fx, fy = fov_arr[:, 0], fov_arr[:, 1]
 
-    for x, y in fov:
-        xi = int(np.argmin(np.abs(xs - x)))
-        yi = int(np.argmin(np.abs(ys - y)))
+        dx_step = xs[1] - xs[0] if nx > 1 else 1.0
+        dy_step = ys[1] - ys[0] if ny > 1 else 1.0
 
-        if np.isclose(xs[xi], x) and np.isclose(ys[yi], y):
-            visible_indices.append((yi, xi))
+        xi = np.rint((fx - xs[0]) / dx_step).astype(int)
+        yi = np.rint((fy - ys[0]) / dy_step).astype(int)
+
+        in_bounds = (xi >= 0) & (xi < nx) & (yi >= 0) & (yi < ny)
+        xi_c = np.clip(xi, 0, nx - 1)
+        yi_c = np.clip(yi, 0, ny - 1)
+        matches = in_bounds & np.isclose(xs[xi_c], fx) & np.isclose(ys[yi_c], fy)
+
+        visible_indices = list(zip(yi[matches].tolist(), xi[matches].tolist()))
 
     visible_set = set(visible_indices)
     sensor_rows = []
@@ -289,7 +345,7 @@ def sampler(cx, cy, X, Y, P_history, samplestep):
 
 #importance_filter returns variance form for easy utility deduction!
 ##LOWER CONFIDENCE BOUND!!
-def importance_filter(mu, P, beta, threshold = 0.3, eps=1e-12): 
+def importance_filter(mu, P, beta, threshold = 0.2, eps=1e-12): 
 
 
     sigma = np.sqrt(np.diag(P))
@@ -298,10 +354,16 @@ def importance_filter(mu, P, beta, threshold = 0.3, eps=1e-12):
     # sigma_min, sigma_max = np.min(sigma), np.max(sigma)
     # mu_norm = (mu - mu_min) / max(mu_max - mu_min, eps)
     # sigma_norm = (sigma - sigma_min) / max(sigma_max - sigma_min, eps)
-    importance = mu - beta * sigma
-    importance_threshold = threshold
+    if LCB == True:
+        importance = mu - beta * sigma
+        importance_threshold = threshold
 
-    importance_mask = importance <= importance_threshold
+        importance_mask = importance <= importance_threshold
+    elif LCB == False:
+        importance = mu + beta * sigma
+        importance_threshold = threshold
+
+        importance_mask = importance >= importance_threshold
 
     if not np.any(importance_mask):
         importance_mask = np.ones_like(importance, dtype=bool)
@@ -368,28 +430,49 @@ def build_pyramid_lattice_3d(xs, ys, zmin, zmax, margin=None): ###changing hardc
     ys = np.asarray(ys, dtype=float)
     xmin, xmax = xs.min() + margin, xs.max() - margin
     ymin, ymax = ys.min() + margin, ys.max() - margin
-
-    # if xmin > xmax or ymin > ymax:
-    #     raise ValueError("map too small")
+    center_x, center_y = (xmin + xmax) / 2.0, (ymin + ymax) / 2.0
+    half_x, half_y = (xmax - xmin) / 2.0, (ymax - ymin) / 2.0
 
     def snap_positions(values, grid):
         return [float(grid[np.argmin(np.abs(grid - value))]) for value in values]
 
-    low_x = snap_positions(np.linspace(xmin, xmax, 4), xs)
-    low_y = snap_positions(np.linspace(ymin, ymax, 4), ys)
-    middle_x = snap_positions(np.linspace(xmin, xmax, 3), xs)
-    middle_y = snap_positions(np.linspace(ymin, ymax, 3), ys)
-    mt_x = snap_positions(np.linspace(xmin, xmax, 2), xs)
-    mt_y = snap_positions(np.linspace(ymin, ymax, 2), ys)
-    top_x = snap_positions([(xmin + xmax) / 2.0], xs)
-    top_y = snap_positions([(ymin + ymax) / 2.0], ys)
+    def layer_bounds(inset_frac):
+        # inset_frac=0 -> full inset domain (the base of the pyramid); larger
+        # inset_frac shrinks the layer's footprint symmetrically toward the
+        # center, giving the lattice its tapering pyramid/frustum shape.
+        hx = half_x * (1.0 - inset_frac)
+        hy = half_y * (1.0 - inset_frac)
+        return center_x - hx, center_x + hx, center_y - hy, center_y + hy
 
-    z_layers = np.linspace(float(zmin), float(zmax), 4)
+    # Insets chosen (rather than plain thirds) so each layer's snapped grid
+    # points land on distinct cells - with thirds, the low and top layers'
+    # snapped x/y values coincide, putting stacked same-xy candidates back
+    # into the lattice despite the tapering footprint.
+    low_xmin, low_xmax, low_ymin, low_ymax = layer_bounds(0.0)
+    low_x = snap_positions(np.linspace(low_xmin, low_xmax, 5), xs)
+    low_y = snap_positions(np.linspace(low_ymin, low_ymax, 5), ys)
+
+    middle_xmin, middle_xmax, middle_ymin, middle_ymax = layer_bounds(0.30)
+    middle_x = snap_positions(np.linspace(middle_xmin, middle_xmax, 3), xs)
+    middle_y = snap_positions(np.linspace(middle_ymin, middle_ymax, 3), ys)
+
+    top_xmin, top_xmax, top_ymin, top_ymax = layer_bounds(0.60)
+    top_x = snap_positions(np.linspace(top_xmin, top_xmax, 2), xs)
+    top_y = snap_positions(np.linspace(top_ymin, top_ymax, 2), ys)
+
+    # dynamics_3d snaps cz to the nearest multiple of `step` every timestep
+    # (cz = step * round(cz / step)), so an unsnapped middle z-tier (e.g. the
+    # z=25 midpoint of a 10..40 range) can be approached but never landed on
+    # exactly - "reached" would never become literally true, and a
+    # single-step planner re-querying candidates from that stuck position
+    # would keep re-selecting the same unreachable tier forever. Snap the
+    # tiers onto the same step-spaced z grid dynamics_3d actually reaches,
+    # the same way the xy layers above are already snapped onto xs/ys.
+    zs = np.arange(float(zmin), float(zmax) + 1e-9, step)
+    z_layers = snap_positions(np.linspace(float(zmin), float(zmax), 3), zs)
     lattice = [(x, y, float(z_layers[0])) for x in low_x for y in low_y]
     lattice.extend((x, y, float(z_layers[1])) for x in middle_x for y in middle_y)
-    lattice.extend((x, y, float(z_layers[2])) for x in mt_x for y in mt_y)
-    top_z = float(z_layers[3])
-    lattice.append((top_x[0], top_y[0], top_z))
+    lattice.extend((x, y, float(z_layers[2])) for x in top_x for y in top_y)
     return list(dict.fromkeys(lattice))
 
 
@@ -402,7 +485,9 @@ def covariance_after_sensor(P, sensor, R):
     projected_cov = np.asarray(sensor @ P)
     innovation_cov = np.asarray(sensor @ projected_cov.T) + noise_covariance
     try:
-        solved = np.linalg.solve(innovation_cov, projected_cov)
+        # innovation_cov = sensor @ P @ sensor.T + R is symmetric
+        # positive-definite (covariance + noise), so Cholesky beats LU here.
+        solved = spd_solve(innovation_cov, projected_cov, assume_a="pos")
     except np.linalg.LinAlgError:
         solved = np.linalg.pinv(innovation_cov) @ projected_cov
 
@@ -410,7 +495,32 @@ def covariance_after_sensor(P, sensor, R):
     return 0.5 * (posterior + posterior.T)
 
 
-def grid_search_3d(
+def _select_argmax_candidate(scored_candidates, rng):
+    return max(scored_candidates, key=lambda item: item[0])
+
+
+def _select_softmax_candidate(scored_candidates, rng, temperature):
+    scores = np.asarray([item[0] for item in scored_candidates], dtype=float)
+    score_range = scores.max() - scores.min()
+    normalized = (scores - scores.min()) / max(score_range, 1e-12)
+    scaled = normalized / max(float(temperature), 1e-12)
+    scaled -= scaled.max()  # numerical stability, doesn't change the resulting probabilities
+    weights = np.exp(scaled)
+    probabilities = weights / weights.sum()
+    choice_idx = rng.choice(len(scored_candidates), p=probabilities)
+    return scored_candidates[choice_idx]
+
+
+def _select_tiebreak_candidate(scored_candidates, rng, tie_tolerance):
+    scores = np.asarray([item[0] for item in scored_candidates], dtype=float)
+    score_range = scores.max() - scores.min()
+    threshold = scores.max() - tie_tolerance * max(score_range, 1e-12)
+    tied_indices = np.flatnonzero(scores >= threshold)
+    choice_idx = tied_indices[rng.integers(len(tied_indices))]
+    return scored_candidates[choice_idx]
+
+
+def _grid_search_3d_impl(
     mu,
     P,
     xs,
@@ -421,6 +531,8 @@ def grid_search_3d(
     planning_horizon,
     zmin,
     zmax,
+    select_fn,
+    rng,
     alpha=0.02,
     angle_of_view=60.0,
     max_measurements=64,
@@ -458,9 +570,7 @@ def grid_search_3d(
             score = gain / max(distance, step)
             scored_candidates.append((score, candidate, sensor, measurement_noise))
 
-        _, best, best_sensor, best_variance = max(
-            scored_candidates, key=lambda item: item[0]
-        )
+        _, best, best_sensor, best_variance = select_fn(scored_candidates, rng)
         selected_waypoints.append(best)
         available.remove(best)
         simulated_covariance = covariance_after_sensor(
@@ -471,7 +581,135 @@ def grid_search_3d(
     return selected_waypoints
 
 
-def next_best_waypoint(grid_util_values, curr_x, curr_y, alpha = 0.1): 
+def grid_search_3d(
+    mu,
+    P,
+    xs,
+    ys,
+    start_pose,
+    beta,
+    utility_threshold,
+    planning_horizon,
+    zmin,
+    zmax,
+    alpha=0.02,
+    angle_of_view=60.0,
+    max_measurements=64,
+):
+    """Deterministic version: greedy argmax over candidate waypoints every step."""
+    return _grid_search_3d_impl(
+        mu,
+        P,
+        xs,
+        ys,
+        start_pose,
+        beta,
+        utility_threshold,
+        planning_horizon,
+        zmin,
+        zmax,
+        select_fn=_select_argmax_candidate,
+        rng=None,
+        alpha=alpha,
+        angle_of_view=angle_of_view,
+        max_measurements=max_measurements,
+    )
+
+
+def grid_search_3d_softmax(
+    mu,
+    P,
+    xs,
+    ys,
+    start_pose,
+    beta,
+    utility_threshold,
+    planning_horizon,
+    zmin,
+    zmax,
+    alpha=0.02,
+    angle_of_view=60.0,
+    max_measurements=64,
+    temperature=GRID_SEARCH_SOFTMAX_TEMPERATURE,
+    seed=GRID_SEARCH_SOFTMAX_SEED,
+):
+    """Stochastic version: samples each step's waypoint from a softmax over
+    candidate scores instead of taking the argmax, so repeated calls (and
+    therefore the warm start handed to CMA-ES) can diverge into different
+    trajectories. Drop-in replacement for grid_search_3d - same signature
+    plus temperature/seed."""
+    rng = np.random.default_rng(seed)
+
+    def select_fn(scored_candidates, rng):
+        return _select_softmax_candidate(scored_candidates, rng, temperature)
+
+    return _grid_search_3d_impl(
+        mu,
+        P,
+        xs,
+        ys,
+        start_pose,
+        beta,
+        utility_threshold,
+        planning_horizon,
+        zmin,
+        zmax,
+        select_fn=select_fn,
+        rng=rng,
+        alpha=alpha,
+        angle_of_view=angle_of_view,
+        max_measurements=max_measurements,
+    )
+
+
+def grid_search_3d_tiebreak(
+    mu,
+    P,
+    xs,
+    ys,
+    start_pose,
+    beta,
+    utility_threshold,
+    planning_horizon,
+    zmin,
+    zmax,
+    alpha=0.02,
+    angle_of_view=60.0,
+    max_measurements=64,
+    tie_tolerance=GRID_SEARCH_TIE_TOLERANCE,
+    seed=GRID_SEARCH_TIEBREAK_SEED,
+):
+    """Stochastic version that only randomizes among candidates within
+    tie_tolerance of the top score each step. Unlike grid_search_3d_softmax,
+    this never trades away score for diversity - it only resolves genuine (or
+    near-floating-point) ties that argmax would otherwise always break the same
+    way. Drop-in replacement for grid_search_3d - same signature plus
+    tie_tolerance/seed."""
+    rng = np.random.default_rng(seed)
+
+    def select_fn(scored_candidates, rng):
+        return _select_tiebreak_candidate(scored_candidates, rng, tie_tolerance)
+
+    return _grid_search_3d_impl(
+        mu,
+        P,
+        xs,
+        ys,
+        start_pose,
+        beta,
+        utility_threshold,
+        planning_horizon,
+        zmin,
+        zmax,
+        select_fn=select_fn,
+        rng=rng,
+        alpha=alpha,
+        angle_of_view=angle_of_view,
+        max_measurements=max_measurements,
+    )
+
+
+def next_best_waypoint(grid_util_values, curr_x, curr_y, alpha = 0.1):
     scored = []
     for util, (x, y) in grid_util_values:
         dist = np.hypot(x - curr_x, y - curr_y)
@@ -592,7 +830,9 @@ def masked_expected_variance_reduction(P, mask, obs_indices, R):
     cross_cov = P[np.ix_(mask_indices, obs_indices)]
 
     try:
-        solved = np.linalg.solve(S, cross_cov.T)
+        # S = P[obs,obs] + R*I is symmetric positive-definite (covariance +
+        # noise), so a Cholesky-based solve is ~2x faster than general LU.
+        solved = spd_solve(S, cross_cov.T, assume_a="pos")
         reduction = np.sum(cross_cov.T * solved, axis=0)
     except np.linalg.LinAlgError:
         solved = np.linalg.pinv(S) @ cross_cov.T
@@ -619,7 +859,9 @@ def masked_expected_variance_reduction_from_sensor(P, mask, sensor, R):
     cross_cov = projected_cov[:, mask_indices].T
 
     try:
-        solved = np.linalg.solve(innovation_cov, cross_cov.T)
+        # innovation_cov = sensor @ P @ sensor.T + R is symmetric
+        # positive-definite (covariance + noise), so Cholesky beats LU here.
+        solved = spd_solve(innovation_cov, cross_cov.T, assume_a="pos")
     except np.linalg.LinAlgError:
         solved = np.linalg.pinv(innovation_cov) @ cross_cov.T
 
@@ -747,13 +989,6 @@ def trajectory_objective_3d(
         ):
             penalty -= 1000.0
 
-    previous = np.array([start_x, start_y, start_z], dtype=float)
-    total_distance = 0.0
-    for point in spline_path_3d:
-        point = np.asarray(point, dtype=float)
-        total_distance += float(np.linalg.norm(point - previous))
-        previous = point
-
     if predictive_variance:
         importance_mask = cached_importance_mask
         if importance_mask is None:
@@ -766,8 +1001,7 @@ def trajectory_objective_3d(
         variance_reduction = masked_expected_variance_reduction_from_sensor(
             P, importance_mask, sensor, measurement_variances
         )
-        rate_score = variance_reduction / max(total_distance, step)
-        total_score = penalty + rate_score
+        total_score = penalty + variance_reduction
     else:
         total_score = penalty
         X, Y = np.meshgrid(xs, ys)
@@ -880,7 +1114,10 @@ def cma_es_refine_waypoints_3d(
         margin=margin,
     )
     x0 = flatten_waypoints_3d(initial_waypoints)
-    sigma0 = 4.0
+    # sigma0 is a nominal base of 1.0; the actual per-axis step size is carried
+    # by CMA_stds below (x/y get CMA_STEP_SIZE_XY, z gets CMA_STEP_SIZE_Z).
+    sigma0 = 1.0
+    cma_stds = np.tile([CMA_STEP_SIZE_XY, CMA_STEP_SIZE_XY, CMA_STEP_SIZE_Z], len(initial_waypoints))
 
     lower_bounds = []
     upper_bounds = []
@@ -902,6 +1139,7 @@ def cma_es_refine_waypoints_3d(
         "seed": seed,
         "verb_disp": 0,
         "verb_log": 0,
+        "CMA_stds": cma_stds,
     }
     if maxfevals is not None:
         cma_options["maxfevals"] = maxfevals
@@ -1068,7 +1306,7 @@ def kalman_update(mu, P, sensor, z_meas, R, block_ids=None):
     return mu, P
 
 
-def initialize_gp(sigma2=0.101**2, lengthscale=4.79, xmin=0.0, xmax=100.0, ymin=0.0, ymax=100.0):
+def initialize_gp(sigma2=0.109**2, lengthscale=17.09, xmin=0.0, xmax=100.0, ymin=0.0, ymax=100.0):
     kernel = ConstantKernel(
         sigma2, constant_value_bounds="fixed"
     ) * Matern(
@@ -1373,8 +1611,9 @@ def create_plots_and_gifs(path, mu_history, P_history, step_numbers, grad_histor
                 vmax=varmax
             )
 
-            px, py = pos_history[min(i, len(pos_history) - 1)]
+            px, py, frame_radius = footprint_for_frame(i)
             plt.plot(px, py, "wo", markersize=5)
+            add_fov_rectangle(plt.gca(), px, py, frame_radius, "cyan")
 
             plt.colorbar(label="Variance")
             plt.title(f"Variance after {step_num} measurements")
@@ -1495,7 +1734,7 @@ if __name__ == "__main__":
     mu_history.append(mu.copy())
     P_history.append(P.copy())
     step_numbers.append(0)
-    utility_threshold = 4.0
+    utility_threshold = 0.4
 
     initial_utility = utility_function(mu, P, utility_threshold)
     utility_history.append(initial_utility)

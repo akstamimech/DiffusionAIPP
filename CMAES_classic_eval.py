@@ -32,13 +32,13 @@ timealloted = 150
 beta = 1
 alpha = 0.02
 utility_threshold = 0.3 #utility threshold needs to be the same for evaluation purposes. For NAIP its 0.3. 
-planning_horizon = 8
+planning_horizon = 7
 MAP_ID_START = 20
 MAP_ID_END = 25
 RUNS_PER_MAP = 5 
 MAPTYPE = "NAIP"
 samples_per_segment = 5
-execution_chunk = 20
+execution_chunk = 36
 SENSORNOISE_SEED = 123
 CMAES_SEED = 42
 output_root = SCRIPT_DIR / "classic_batch_metrics"
@@ -87,6 +87,17 @@ def write_metric_summary(metriclist, summary_path):
     print(f"\nSaved summary metrics to {summary_path}")
 
 
+def write_variance_trace(var_history, trace_path):
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savetxt(
+        trace_path,
+        np.asarray(var_history, dtype=float),
+        delimiter=",",
+        header="total_variance",
+        comments="",
+    )
+
+
 def load_map_context(selected_map, xs, ys, xmin, ymin, gp_step):
     data = np.loadtxt(
         SCRIPT_DIR / "csv" / f"map_{selected_map}_{MAPTYPE}_grid_counts.csv",
@@ -126,6 +137,7 @@ def real_receding_horizon_planner(
     beta,
     planning_horizon,
     alpha=0.1,
+    seed = None
 ):
     flight_plan = grid_search_3d(
         mu,
@@ -139,6 +151,7 @@ def real_receding_horizon_planner(
         zmin=ZMIN,
         zmax=ZMAX,
         alpha=alpha,
+        
     )
 
     return cma_es_refine_waypoints_3d(
@@ -155,6 +168,7 @@ def real_receding_horizon_planner(
         ZMIN,
         ZMAX,
         predictive_variance=True,
+        seed = seed
     )
 
 
@@ -239,7 +253,6 @@ def run_map(
     sensor_seed = SENSORNOISE_SEED + selected_map
     planner_seed = CMAES_SEED + selected_map * 1000 + run_index
     rng = np.random.default_rng(sensor_seed)
-    gp_training.CMA_SEED = planner_seed
 
     pos_history = []
     pose_history = []
@@ -263,7 +276,7 @@ def run_map(
 
     spline_path = []
     spline_idx = 0
-    executed_since_replan = 0
+    var_history = []
 
     for ts in range(0, timealloted):
         if ts <= 1:
@@ -272,7 +285,7 @@ def run_map(
             pos_history.append((cx, cy))
             pose_history.append((cx, cy, cz))
         else:
-            if ts == 2 or executed_since_replan >= execution_chunk or spline_idx >= len(spline_path):
+            if ts == 2 or spline_idx >= execution_chunk or spline_idx >= len(spline_path):
                 control_waypoints = real_receding_horizon_planner(
                     cx,
                     cy,
@@ -285,6 +298,7 @@ def run_map(
                     beta,
                     planning_horizon,
                     alpha=alpha,
+                    seed=planner_seed
                 )
                 spline_path = build_spline_trajectory_3d(
                     cx,
@@ -294,7 +308,6 @@ def run_map(
                     samples_per_segment=samples_per_segment,
                 )
                 spline_idx = 0
-                executed_since_replan = 0
                 print(
                     f"Map {selected_map} run {run_index}: Replanning with "
                     f"{len(control_waypoints)} control waypoints and "
@@ -339,7 +352,6 @@ def run_map(
                 )
                 pos_history.append((cx, cy))
                 pose_history.append((cx, cy, cz))
-                executed_since_replan += 1
             else:
                 pos_history.append((cx, cy))
                 pose_history.append((cx, cy, cz))
@@ -357,6 +369,7 @@ def run_map(
         mu, P = kalman_update(
             mu, P, sensor, z_meas, R_cov, block_ids=sensor_block_ids
         )
+        var_history.append(np.sum(np.diag(P)))
 
         reconstruction_metrics = compute_reconstruction_rmse(
             mu=mu,
@@ -378,6 +391,10 @@ def run_map(
         delimiter=",",
         header="global_rmse,occupied_rmse",
         comments="",
+    )
+    write_variance_trace(
+        var_history,
+        output_dir / f"map_{selected_map}_run_{run_index:02d}_variance_over_time.csv",
     )
 
     final_variance = np.sum(np.diag(P))

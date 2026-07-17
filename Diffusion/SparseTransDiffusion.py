@@ -26,7 +26,7 @@ PLOT_DIR = SCRIPT_DIR / "plots"
 PLOT_DIR.mkdir(exist_ok=True)
 
 
-#THIS COPY - BATCH_SIZE 128 + K=2 DATASET + SMALLER TOKENIZATION, MLP RATIO + SPLINE LOSS TERM. K1 MODEL CAN'T HAVE WEIGHTED LOSS
+#THIS COPY - BATCH_SIZE 256 + K=2 DATASET + OUTPUT MLP + NO SPLINE LOSS TERM. K1 MODEL CAN'T HAVE WEIGHTED LOSS
 
 """
 HOW TO RUN THIS FILE:
@@ -117,7 +117,7 @@ posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod
 
 
 data_dict = torch.load(
-    SCRIPT_DIR / "CMAES_beamsearch_dataset_dynamic_01_59.pt"
+    SCRIPT_DIR / "CMAES_beamsearch_dataset_dynamic_01_86.pt"
 )
 dense_trajectories = data_dict["trajectories"].float()
 control_waypoints = data_dict["control_waypoints"].float()
@@ -910,8 +910,8 @@ def get_loss(
 
     spline_loss = (traj_noise_pred - traj_noise_true).pow(2).mean(dim=[1, 2])
 
-    per_sample_loss = waypoint_loss + alpha * spline_loss
-#    per_sample_loss = waypoint_loss
+#    per_sample_loss = waypoint_loss + alpha * spline_loss
+    per_sample_loss = waypoint_loss
     
 #    return (per_sample_loss * weights).sum() / (weights.sum() + 1e-6)
     return per_sample_loss.mean()

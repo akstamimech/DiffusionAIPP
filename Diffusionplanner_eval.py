@@ -329,7 +329,6 @@ def run_map(
 
     spline_path = []
     spline_idx = 0
-    executed_since_replan = 0
 
     for ts in range(0, timealloted):
         if ts <= 1:
@@ -339,7 +338,7 @@ def run_map(
             current_heading_velocity = np.array([cx - prev_x, cy - prev_y], dtype=np.float32)
             pos_history.append((cx, cy))
         else:
-            if ts == 2 or executed_since_replan >= execution_chunk or spline_idx >= len(spline_path):
+            if ts == 2 or spline_idx >= execution_chunk or spline_idx >= len(spline_path):
                 current_mean = mu.reshape(X.shape)
                 current_var = np.diag(P).reshape(X.shape)
                 dense_traj, _ = sample_diffusion_trajectory(
@@ -353,7 +352,6 @@ def run_map(
                 )
                 spline_path = dense_traj.T.tolist()
                 spline_idx = 0
-                executed_since_replan = 0
                 print(
                     f"Map {selected_map} run {run_index}: Replanning with "
                     f"{len(spline_path)} spline coordinates."
@@ -387,7 +385,6 @@ def run_map(
                 cx, cy = dynamics(cx, cy, grad_x, grad_y, gp_step, samplestep, xmin, xmax, ymin, ymax)
                 current_heading_velocity = np.array([cx - prev_x, cy - prev_y], dtype=np.float32)
                 pos_history.append((cx, cy))
-                executed_since_replan += 1
             else:
                 pos_history.append((cx, cy))
 
