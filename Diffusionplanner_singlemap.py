@@ -34,19 +34,27 @@ from sample_3d_sparse_trans_diffusion import diffusion
 
 #NAIP 41 is a very nice map tbh
 step = 2.0
-timealloted = 300
+timealloted = int(os.environ.get("TIMEALLOTED", "3000"))
 beta = 1.0
 alpha = 0.02
-utility_threshold = 0.3
-planning_horizon = 8
-selected_map = int(os.environ.get("SELECTED_MAP", 58))
+utility_threshold = float(os.environ.get("UTILITY_THRESHOLD", "0.5"))
+planning_horizon = int(os.environ.get("PLANNING_HORIZON", "8"))
+selected_map = int(os.environ.get("SELECTED_MAP", 53))
 samples_per_segment = 5
-execution_chunk = int(os.environ.get("EXECUTION_CHUNK", 10))
-SENSORNOISE_SEED = 123
-MAPTYPE = os.environ.get("MAPTYPE", "NAIP")
+execution_chunk = int(os.environ.get("EXECUTION_CHUNK", 40))
+SENSORNOISE_SEED = int(os.environ.get("SENSORNOISE_SEED", "123"))
+MAPTYPE = os.environ.get("MAPTYPE", "grf")
 CHUNK_SIZE = 256
 CHUNK_PREFIX = "./trajectory_dataset_chunk"
-WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "100"))  # <=0 = unconstrained (timestep
+ETA = float(os.environ.get("ETA", "0.0"))
+RUN_SEED_ENV = os.environ.get("RUN_SEED")
+if RUN_SEED_ENV is not None:
+    RUN_SEED = int(RUN_SEED_ENV)
+    np.random.seed(RUN_SEED)
+    torch.manual_seed(RUN_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(RUN_SEED)
+WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "300"))  # <=0 = unconstrained (timestep
                                                                       # loop runs to completion); otherwise
                                                                       # the flight ends at timealloted
                                                                       # timesteps OR this many real
@@ -59,12 +67,17 @@ WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "100"))  # <=0 = u
 # than that gets padded with a sleep up to the floor; a step that already took
 # longer (e.g. one that triggered a diffusion replan) is left alone - this is
 # a floor, not a fixed duration.
-ENFORCE_MIN_STEP_TIME = os.environ.get("ENFORCE_MIN_STEP_TIME", "0") == "1"
+ENFORCE_MIN_STEP_TIME = os.environ.get("ENFORCE_MIN_STEP_TIME", "1") == "1"
 STEP_DISTANCE_METERS = 1.0
 FLIGHT_SPEED_MPS = 3.0
 MIN_STEP_SECONDS = STEP_DISTANCE_METERS / FLIGHT_SPEED_MPS
 
-diffusion_path = DIFFUSION_DIR / "checkpoints" / "sparse_trans_waypoints_epoch_1000_multimodaltest.pth"
+diffusion_path = Path(
+    os.environ.get(
+        "DIFFUSION_CHECKPOINT",
+        str(SCRIPT_DIR / "checkpoints" / "current_best.pth"),
+    )
+)
 # diffusion_path = DIFFUSION_DIR / "checkpoints" / "dppo_best.pth"
 INIT_ALTITUDE = 10.0
 ZMIN = diffusion.Z_MIN
@@ -87,7 +100,7 @@ def load_diffusion_model(checkpoint_path=None):
         )
         state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
         state_dict = diffusion.remap_legacy_state_dict_keys(state_dict)
-        model.load_state_dict(state_dict)
+        diffusion.load_model_state_dict_compatible(model, state_dict)
     model.eval()
     diffusion.model = model
     return model
@@ -117,6 +130,9 @@ def sample_diffusion_trajectory(
     current_var = torch.tensor(current_var, dtype=torch.float32, device=diffusion.device)
 
     mean_map = (current_mean - diffusion.mean_center.to(diffusion.device)) / diffusion.mean_scale.to(diffusion.device)
+    total_variance_condition = diffusion.normalize_total_variance(
+        current_var.reshape(1, -1).sum(dim=1, keepdim=True)
+    ).to(diffusion.device)
     var_map = (current_var - diffusion.var_center.to(diffusion.device)) / diffusion.var_scale.to(diffusion.device)
     marker_map = diffusion.make_position_marker_maps(
         current_position_world[:, :2].cpu(),
@@ -147,9 +163,10 @@ def sample_diffusion_trajectory(
         meanvarmarker_map,
         current_position=current_position_model,
         initial_heading_velocity=initial_heading_velocity,
+        total_variance_condition=total_variance_condition,
         num_steps=num_steps,
         clip_x0=clip_x0,
-        eta = 1.0
+        eta = ETA
     )
 
     control_waypoints = diffusion.extract_control_waypoints(sparse_sample[0])
@@ -328,14 +345,19 @@ def finalize_chunks(num_chunks, final_path="./trajectory_dataset.pt"):
 
 
 if __name__ == "__main__":
-    csv_path = r"C:\Users\Aksha\OneDrive\Year 6\Thesis\scripts\csv"
-    output_dir = Path(__file__).resolve().parent / "Vizualization" / f"diffusion_map_{MAPTYPE}_{selected_map}_viz"
+    csv_path = Path(os.environ.get("CSV_DIR", str(SCRIPT_DIR / "csv")))
+    output_name = f"diffusion_map_{MAPTYPE}_{selected_map}_viz"
+    run_output_tag = os.environ.get("RUN_OUTPUT_TAG")
+    if run_output_tag:
+        output_name = f"{output_name}_{run_output_tag}"
+    results_root = Path(os.environ.get("RESULTS_ROOT", str(SCRIPT_DIR / "Vizualization")))
+    output_dir = results_root / output_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
     diffusion_model = load_diffusion_model(checkpoint_path=diffusion_path)
 
     data = np.loadtxt(
-        rf"{csv_path}/map_{selected_map}_{MAPTYPE}_grid_counts.csv",
+        csv_path / f"map_{selected_map}_{MAPTYPE}_grid_counts.csv",
         delimiter=",",
         skiprows=1,
     )
@@ -355,7 +377,7 @@ if __name__ == "__main__":
 
     rng = np.random.default_rng(SENSORNOISE_SEED + selected_map)
 
-    mean = np.full(X_test.shape[0], utility_threshold - 0.1)
+    mean = np.full(X_test.shape[0], utility_threshold + 0.1) #IF LCB WE NEED TO SWITCH THIS
     mu = mean.copy()
     P = cov.copy()
 
@@ -371,14 +393,17 @@ if __name__ == "__main__":
     pose_history = []
     altitude_history = []
 
-    mu_history.append(mu.copy())
-    P_history.append(P.copy())
+    collect_viz_history = os.environ.get("SKIP_VIZ", "0") != "1"
+    if collect_viz_history:
+        mu_history.append(mu.copy())
+        P_history.append(P.copy())
     step_numbers.append(0)
     planned_path_history.append([])
     control_waypoint_history.append([])
 
     initial_utility = importance_filter(mu, P, beta, threshold=utility_threshold)
-    utility_history.append(initial_utility.copy())
+    if collect_viz_history:
+        utility_history.append(initial_utility.copy())
 
     save_every = 5
     lateral_coverage = step * 2
@@ -392,11 +417,13 @@ if __name__ == "__main__":
     altitude_history.append(cz)
 
     initial_var_field = np.diag(P).reshape(X.shape)
-    gy0, gx0 = np.gradient(initial_var_field, Y[:, 0], X[0, :])
-    grad_history.append((gx0, gy0))
-    sorted_util_values_list.append(grid_measure(initial_utility, xs, ys))
+    if collect_viz_history:
+        gy0, gx0 = np.gradient(initial_var_field, Y[:, 0], X[0, :])
+        grad_history.append((gx0, gy0))
+        sorted_util_values_list.append(grid_measure(initial_utility, xs, ys))
 
     initial_total_variance = np.sum(np.diag(P))
+    variance_history = [initial_total_variance]
     print(f"Map {selected_map}: Initial total variance: {initial_total_variance:.4f}")
 
     utility = initial_utility
@@ -580,14 +607,16 @@ if __name__ == "__main__":
             rng,
         )
         utility = importance_filter(mu, P, beta, threshold=utility_threshold)
-        mu_history.append(mu.copy())
-        P_history.append(P.copy())
-        utility_history.append(utility.copy())
-        sorted_util_values_list.append(grid_measure(utility, xs, ys))
+        variance_history.append(float(np.sum(np.diag(P))))
+        if collect_viz_history:
+            mu_history.append(mu.copy())
+            P_history.append(P.copy())
+            utility_history.append(utility.copy())
+            sorted_util_values_list.append(grid_measure(utility, xs, ys))
 
-        var_field = np.diag(P).reshape(X.shape)
-        gy, gx = np.gradient(var_field, Y[:, 0], X[0, :])
-        grad_history.append((gx, gy))
+            var_field = np.diag(P).reshape(X.shape)
+            gy, gx = np.gradient(var_field, Y[:, 0], X[0, :])
+            grad_history.append((gx, gy))
 
         util = utility.reshape(len(ys), len(xs))
 
@@ -619,7 +648,7 @@ if __name__ == "__main__":
 
     timestep_index = np.asarray(step_numbers[1:], dtype=int)
     wall_time_arr = np.asarray(wall_time_history, dtype=float)
-    variancelist = [np.sum(np.diag(P)) for P in P_history]
+    variancelist = variance_history
     variance_per_step = np.asarray(variancelist[1:], dtype=float)
 
     metrics_trace = np.column_stack(
@@ -630,6 +659,20 @@ if __name__ == "__main__":
         metrics_trace,
         delimiter=",",
         header="timestep,wall_time_seconds,global_rmse,occupied_rmse,global_variance",
+        comments="",
+    )
+    pose_trace = np.column_stack(
+        [
+            np.asarray(step_numbers, dtype=int),
+            np.concatenate(([0.0], wall_time_arr)),
+            np.asarray(pose_history, dtype=float),
+        ]
+    )
+    np.savetxt(
+        output_dir / f"map_{selected_map}_executed_trajectory.csv",
+        pose_trace,
+        delimiter=",",
+        header="timestep,wall_time_seconds,x,y,z",
         comments="",
     )
 

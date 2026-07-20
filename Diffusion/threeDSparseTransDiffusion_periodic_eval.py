@@ -50,7 +50,7 @@ from evalmetrics import compute_reconstruction_rmse
 from CMAES_classic_singlemap import compute_fov, dynamics_3d, waypoint_3d
 
 EVAL_EVERY = int(os.environ.get("EVAL_EVERY", 10))
-EVAL_MAPTYPE = os.environ.get("EVAL_MAPTYPE", "NAIP")
+EVAL_MAPTYPE = os.environ.get("EVAL_MAPTYPE", "grf")
 EVAL_MAP_OVERRIDE = os.environ.get("EVAL_MAP")  # None -> resolved to a held-out val map_id
 EVAL_TIMEALLOTED = 200
 EVAL_EXECUTION_CHUNK = 10
@@ -163,7 +163,7 @@ sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
 posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
 
 
-DATASET_PATH = SCRIPT_DIR.parent / "CMAES_beamsearch_dataset_3d_randomstart_multimodal.pt"
+DATASET_PATH = SCRIPT_DIR.parent / "CMAES_beamsearch_dataset_3d_synthetic_final.pt"
 data_dict = torch.load(
     DATASET_PATH,
     map_location="cpu",
@@ -498,6 +498,25 @@ mean_center = means.mean()
 mean_scale = means.std().clamp_min(1e-6)
 var_center = vars.mean()
 var_scale = vars.std().clamp_min(1e-6)
+raw_total_variances = vars.flatten(1).sum(dim=1, keepdim=True)
+total_variance_log = torch.log1p(raw_total_variances.clamp_min(0.0))
+total_variance_center = total_variance_log.mean()
+total_variance_scale = total_variance_log.std().clamp_min(1e-6)
+total_variance_conditions = (
+    total_variance_log - total_variance_center
+) / total_variance_scale
+
+
+def normalize_total_variance(total_variance):
+    total_variance = torch.as_tensor(total_variance, dtype=torch.float32)
+    if total_variance.ndim == 0:
+        total_variance = total_variance.view(1, 1)
+    elif total_variance.ndim == 1:
+        total_variance = total_variance.unsqueeze(-1)
+    total_variance_log = torch.log1p(total_variance.clamp_min(0.0))
+    return (
+        total_variance_log - total_variance_center.to(total_variance.device)
+    ) / total_variance_scale.to(total_variance.device)
 
 means = (means - mean_center) / mean_scale
 vars = (vars - var_center) / var_scale
@@ -509,6 +528,7 @@ if INDEX is not None and INDEX > 0:
     trajectories = trajectories[:INDEX]
     conditions = conditions[:INDEX]
     initial_heading_velocities = initial_heading_velocities[:INDEX]
+    total_variance_conditions = total_variance_conditions[:INDEX]
     means = means[:INDEX]
     vars = vars[:INDEX]
     rmsedrop = rmsedrop[:INDEX]
@@ -526,6 +546,7 @@ class TrajectoryDataset(Dataset):
         meanvarmarkermaps=meanvarmarkermaps,
         conditions=None,
         initial_heading_velocities=None,
+        total_variance_conditions=None,
     ):
         self.trajectories = trajectories
         self.weights = weights
@@ -533,6 +554,7 @@ class TrajectoryDataset(Dataset):
         self.conditions = conditions
         self.meanvarmarkermaps = meanvarmarkermaps
         self.initial_heading_velocities = initial_heading_velocities
+        self.total_variance_conditions = total_variance_conditions
 
     def __len__(self):
         return len(self.trajectories)
@@ -544,11 +566,20 @@ class TrajectoryDataset(Dataset):
             initial_heading_velocity = torch.zeros_like(self.conditions[idx])
         else:
             initial_heading_velocity = self.initial_heading_velocities[idx]
+        if self.total_variance_conditions is None:
+            total_variance_condition = torch.zeros(
+                1,
+                dtype=self.trajectories.dtype,
+                device=self.trajectories.device,
+            )
+        else:
+            total_variance_condition = self.total_variance_conditions[idx]
         return (
             self.trajectories[idx],
             self.conditions[idx],
             self.meanvarmarkermaps[idx],
             initial_heading_velocity,
+            total_variance_condition,
             self.weights[idx],
         )
 
@@ -780,8 +811,18 @@ class WPTokenization(nn.Module):
         self.final_norm = nn.LayerNorm(token_dim)
         self.current_pos_mlp = nn.Sequential(nn.Linear(NUM_COORDS, token_dim), nn.SiLU(), nn.Linear(token_dim, token_dim))
         self.heading_mlp = nn.Sequential(nn.Linear(NUM_COORDS, token_dim), nn.SiLU(), nn.Linear(token_dim, token_dim))
+        self.total_variance_mlp = nn.Sequential(nn.Linear(1, token_dim), nn.SiLU(), nn.Linear(token_dim, token_dim))
+        nn.init.zeros_(self.total_variance_mlp[-1].weight)
+        nn.init.zeros_(self.total_variance_mlp[-1].bias)
 
-    def forward(self, x, t, current_position, initial_heading_velocity=None): 
+    def forward(
+        self,
+        x,
+        t,
+        current_position,
+        initial_heading_velocity=None,
+        total_variance_condition=None,
+    ): 
         """
         x: [B, 3, 8]
         returns: [B, 8, token_dim], one token per waypoint.
@@ -811,9 +852,26 @@ class WPTokenization(nn.Module):
         heading_tokens = self.heading_mlp(initial_heading_velocity) # [B, token_dim]
         heading_tokens = heading_tokens.unsqueeze(1) # [B, 1, token_dim]
 
+        if total_variance_condition is None:
+            total_variance_condition = torch.zeros(
+                current_position.shape[0],
+                1,
+                device=current_position.device,
+                dtype=current_position.dtype,
+            )
+        total_variance_condition = total_variance_condition.to(
+            device=current_position.device,
+            dtype=current_position.dtype,
+        )
+        if total_variance_condition.ndim == 1:
+            total_variance_condition = total_variance_condition.unsqueeze(-1)
+        total_variance_tokens = self.total_variance_mlp(total_variance_condition) # [B, token_dim]
+        total_variance_tokens = total_variance_tokens.unsqueeze(1) # [B, 1, token_dim]
+
         waypoint_tokens = waypoint_tokens + time_tokens # add timestep embedding to each waypoint token
         waypoint_tokens = waypoint_tokens + current_pos_tokens # add current position embedding to each waypoint token
         waypoint_tokens = waypoint_tokens + heading_tokens # add initial heading velocity embedding to each waypoint token
+        waypoint_tokens = waypoint_tokens + total_variance_tokens # add total GP uncertainty embedding to each waypoint token
 
         waypoint_tokens = self.final_norm(waypoint_tokens) # normalize across token_dim for each token
         
@@ -966,9 +1024,23 @@ class NoisePredictor(nn.Module):
         # nn.init.zeros_(self.output.bias)
 
 
-    def forward(self, x, t, meanvarmarker_map, current_position=None, initial_heading_velocity=None):
+    def forward(
+        self,
+        x,
+        t,
+        meanvarmarker_map,
+        current_position=None,
+        initial_heading_velocity=None,
+        total_variance_condition=None,
+    ):
         map_tokens = self.mean_var_marker_cnn(meanvarmarker_map) # [B, 64, token_dim]
-        wp_tokens = self.wp_tokenization(x, t, current_position, initial_heading_velocity) # [B, 8, token_dim]
+        wp_tokens = self.wp_tokenization(
+            x,
+            t,
+            current_position,
+            initial_heading_velocity,
+            total_variance_condition,
+        ) # [B, 8, token_dim]
         for attention_block in self.attention_blocks:
             wp_tokens = attention_block(wp_tokens, map_tokens) # [B, 8, token_dim]
         noise_pred = self.output(wp_tokens) # [B, 8, 3]
@@ -991,6 +1063,25 @@ def remap_legacy_state_dict_keys(state_dict):
     return remapped
 
 
+def load_model_state_dict_compatible(model, state_dict):
+    try:
+        return model.load_state_dict(state_dict)
+    except RuntimeError:
+        result = model.load_state_dict(state_dict, strict=False)
+        allowed_prefix = "wp_tokenization.total_variance_mlp."
+        missing_allowed = all(
+            key.startswith(allowed_prefix) for key in result.missing_keys
+        )
+        if result.missing_keys and missing_allowed and not result.unexpected_keys:
+            print(
+                "Loaded checkpoint without total-variance conditioning weights; "
+                "the zero-initialized scalar branch is a no-op until retrained.",
+                flush=True,
+            )
+            return result
+        raise
+
+
 
 def get_loss(
     model,
@@ -999,6 +1090,7 @@ def get_loss(
     meanvarmarker_map,
     current_position,
     initial_heading_velocity=None,
+    total_variance_condition=None,
     weights=None,
     alpha=0.1,
 ):
@@ -1016,6 +1108,7 @@ def get_loss(
             meanvarmarker_map,
             current_position,
             initial_heading_velocity,
+            total_variance_condition,
         )
     noise_pred = noise_pred.float()
 
@@ -1060,6 +1153,7 @@ def ddpo_ddim_sample_timestep(
     meanvarmarker_map,
     current_position,
     initial_heading_velocity=None,
+    total_variance_condition=None,
     clip_x0=False,
     eta = 1.0,
     sigma_prob_min=0.1
@@ -1085,7 +1179,14 @@ def ddpo_ddim_sample_timestep(
 
 
 
-    noise_pred = model(x, t, meanvarmarker_map, current_position, initial_heading_velocity)
+    noise_pred = model(
+        x,
+        t,
+        meanvarmarker_map,
+        current_position,
+        initial_heading_velocity,
+        total_variance_condition,
+    )
     x0_pred = (x - sqrt_one_minus_alpha_bar_t * noise_pred) / sqrt_alpha_bar_t
     if clip_x0:
         x0_pred = x0_pred.clamp(-1.0, 1.0) #clipping!
@@ -1129,6 +1230,7 @@ def ddim_sample_timestep(
     meanvarmarker_map,
     current_position,
     initial_heading_velocity=None,
+    total_variance_condition=None,
     clip_x0=False,
     eta = 1.0,
     sigma_prob_min=0.01
@@ -1154,7 +1256,14 @@ def ddim_sample_timestep(
 
 
 
-    noise_pred = model(x, t, meanvarmarker_map, current_position, initial_heading_velocity)
+    noise_pred = model(
+        x,
+        t,
+        meanvarmarker_map,
+        current_position,
+        initial_heading_velocity,
+        total_variance_condition,
+    )
     x0_pred = (x - sqrt_one_minus_alpha_bar_t * noise_pred) / sqrt_alpha_bar_t
     if clip_x0:
         x0_pred = x0_pred.clamp(-1.0, 1.0) #clipping!
@@ -1185,6 +1294,7 @@ def ddpo_ddim_sample(
     meanvarmarker_map,
     current_position,
     initial_heading_velocity=None,
+    total_variance_condition=None,
     num_steps=None,
     clip_x0=False,
     eta = 1.0
@@ -1214,6 +1324,7 @@ def ddpo_ddim_sample(
             meanvarmarker_map,
             current_position,
             initial_heading_velocity,
+            total_variance_condition,
             clip_x0=clip_x0,
             eta = eta,
             sigma_prob_min=0.1
@@ -1248,6 +1359,7 @@ def ddim_sample(
     meanvarmarker_map,
     current_position,
     initial_heading_velocity=None,
+    total_variance_condition=None,
     num_steps=None,
     clip_x0=False,
     eta = 1.0
@@ -1277,6 +1389,7 @@ def ddim_sample(
             meanvarmarker_map,
             current_position,
             initial_heading_velocity,
+            total_variance_condition,
             clip_x0=clip_x0,
             eta = eta,
             sigma_prob_min=0.1
@@ -1310,7 +1423,14 @@ def sample_plot_traj(output_path=None):
     meanvarmarker_map = meanvarmarkermaps[0:1].to(next(model.parameters()).device)
     current_position = conditions[0:1].to(next(model.parameters()).device)
     initial_heading_velocity = initial_heading_velocities[0:1].to(next(model.parameters()).device)
-    traj, _, _= ddim_sample(traj, meanvarmarker_map, current_position, initial_heading_velocity)
+    total_variance_condition = total_variance_conditions[0:1].to(next(model.parameters()).device)
+    traj, _, _= ddim_sample(
+        traj,
+        meanvarmarker_map,
+        current_position,
+        initial_heading_velocity,
+        total_variance_condition,
+    )
 
     traj_to_plot = extract_control_waypoints(traj[0].cpu())
     truth_to_plot = extract_control_waypoints(trajectories[0].cpu())
@@ -1454,6 +1574,9 @@ def sample_diffusion_trajectory(
     current_var = torch.tensor(current_var, dtype=torch.float32, device=device)
 
     mean_map = (current_mean - mean_center.to(device)) / mean_scale.to(device)
+    total_variance_condition = normalize_total_variance(
+        current_var.reshape(1, -1).sum(dim=1, keepdim=True)
+    ).to(device)
     var_map = (current_var - var_center.to(device)) / var_scale.to(device)
     marker_map = make_position_marker_maps(
         current_position_world[:, :2].cpu(),
@@ -1476,6 +1599,7 @@ def sample_diffusion_trajectory(
         meanvarmarker_map,
         current_position=current_position_model,
         initial_heading_velocity=initial_heading_velocity,
+        total_variance_condition=total_variance_condition,
         num_steps=num_steps,
         clip_x0=clip_x0,
     )
@@ -1669,12 +1793,14 @@ def train_one_sample(model, steps=3000, batch_size=64):
     x0 = trajectories[:1].to(device)
     pos0 = conditions[:1].to(device)
     heading0 = initial_heading_velocities[:1].to(device)
+    total_variance0 = total_variance_conditions[:1].to(device)
     meanvarmarker_map = meanvarmarkermaps[:1].to(device)
 
     for step in range(steps):
         traj = x0.repeat(batch_size, 1, 1)
         current_position = pos0.repeat(batch_size, 1)
         initial_heading_velocity = heading0.repeat(batch_size, 1)
+        total_variance_condition = total_variance0.repeat(batch_size, 1)
         batch_meanvarmarker_map = meanvarmarker_map.repeat(batch_size, 1, 1, 1)
         batch_weights = torch.ones(batch_size, device=device)
 
@@ -1686,6 +1812,7 @@ def train_one_sample(model, steps=3000, batch_size=64):
             batch_meanvarmarker_map,
             current_position,
             initial_heading_velocity,
+            total_variance_condition,
             weights=batch_weights,
         )
         losses.append(loss.item())
@@ -1724,16 +1851,29 @@ def evaluate(model, dataloader):
     model_device = next(model.parameters()).device
 
     for batch in dataloader:
-        if len(batch) == 5:
+        if len(batch) == 6:
+            (
+                traj,
+                current_position,
+                meanvarmarker_map,
+                initial_heading_velocity,
+                total_variance_condition,
+                batch_weights,
+            ) = batch
+        elif len(batch) == 5:
             traj, current_position, meanvarmarker_map, initial_heading_velocity, batch_weights = batch
+            total_variance_condition = None
         else:
             traj, current_position, meanvarmarker_map, batch_weights = batch
             initial_heading_velocity = None
+            total_variance_condition = None
         traj = traj.to(model_device, non_blocking=True)
         current_position = current_position.to(model_device, non_blocking=True)
         meanvarmarker_map = meanvarmarker_map.to(model_device, non_blocking=True)
         if initial_heading_velocity is not None:
             initial_heading_velocity = initial_heading_velocity.to(model_device, non_blocking=True)
+        if total_variance_condition is not None:
+            total_variance_condition = total_variance_condition.to(model_device, non_blocking=True)
         batch_weights = batch_weights.to(model_device, non_blocking=True)
         t = torch.randint(0, T, (traj.shape[0],), device=traj.device).long()
         loss = get_loss(
@@ -1743,6 +1883,7 @@ def evaluate(model, dataloader):
             meanvarmarker_map,
             current_position,
             initial_heading_velocity,
+            total_variance_condition,
             weights=batch_weights,
         )
         batch_weight_sum = batch_weights.sum().item()
@@ -1788,17 +1929,30 @@ def train(
         epoch_weight_sum = 0.0
         for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             stepcount.append(epoch * len(dataloader) + step)
-            if len(batch) == 5:
+            if len(batch) == 6:
+                (
+                    traj,
+                    current_position,
+                    meanvarmarker_map,
+                    initial_heading_velocity,
+                    total_variance_condition,
+                    batch_weights,
+                ) = batch
+            elif len(batch) == 5:
                 traj, current_position, meanvarmarker_map, initial_heading_velocity, batch_weights = batch
+                total_variance_condition = None
             else:
                 traj, current_position, meanvarmarker_map, batch_weights = batch
                 initial_heading_velocity = None
+                total_variance_condition = None
             model_device = next(model.parameters()).device
             traj = traj.to(model_device, non_blocking=True)
             current_position = current_position.to(model_device, non_blocking=True)
             meanvarmarker_map = meanvarmarker_map.to(model_device, non_blocking=True)
             if initial_heading_velocity is not None:
                 initial_heading_velocity = initial_heading_velocity.to(model_device, non_blocking=True)
+            if total_variance_condition is not None:
+                total_variance_condition = total_variance_condition.to(model_device, non_blocking=True)
             batch_weights = batch_weights.to(model_device, non_blocking=True)
             batch_size = traj.shape[0]
             t = torch.randint(0, T, (batch_size,), device=traj.device).long()
@@ -1809,6 +1963,7 @@ def train(
                 meanvarmarker_map,
                 current_position,
                 initial_heading_velocity,
+                total_variance_condition,
                 weights=batch_weights,
             )
             loss_vals.append(loss.item())
@@ -2008,6 +2163,7 @@ if __name__ == "__main__":
         meanvarmarkermaps=meanvarmarkermaps[train_mask],
         conditions=conditions[train_mask],
         initial_heading_velocities=initial_heading_velocities[train_mask],
+        total_variance_conditions=total_variance_conditions[train_mask],
     )
     val_dataset = TrajectoryDataset(
         trajectories[val_mask],
@@ -2015,6 +2171,7 @@ if __name__ == "__main__":
         meanvarmarkermaps=meanvarmarkermaps[val_mask],
         conditions=conditions[val_mask],
         initial_heading_velocities=initial_heading_velocities[val_mask],
+        total_variance_conditions=total_variance_conditions[val_mask],
     )
     val_dataloader_kwargs = dict(dataloader_kwargs)
     val_dataloader_kwargs["shuffle"] = False

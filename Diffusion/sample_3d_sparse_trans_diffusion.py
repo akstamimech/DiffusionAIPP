@@ -70,7 +70,7 @@ def load_model(checkpoint_path, device):
         else payload
     )
     state_dict = diffusion.remap_legacy_state_dict_keys(state_dict)
-    model.load_state_dict(state_dict)
+    diffusion.load_model_state_dict_compatible(model, state_dict)
     model.eval()
     diffusion.model = model
     return model
@@ -94,11 +94,15 @@ def sample_sparse(model, condition_index=0, seed=None, num_steps=None, clip_x0=T
     initial_heading_velocity = diffusion.initial_heading_velocities[
         condition_index : condition_index + 1
     ].to(device)
+    total_variance_condition = diffusion.total_variance_conditions[
+        condition_index : condition_index + 1
+    ].to(device)
     xprev, mean_theta, stateposteriorvariance = diffusion.ddim_sample(
         initial_noise,
         meanvarmarker_map,
         current_position,
         initial_heading_velocity,
+        total_variance_condition,
         num_steps=num_steps,
         clip_x0=clip_x0,
         eta = eta1
