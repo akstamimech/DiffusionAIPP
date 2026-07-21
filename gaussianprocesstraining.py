@@ -13,9 +13,13 @@ from scipy.sparse import csr_matrix, issparse, vstack as sparse_vstack
 
 step = 2.0
 CMA_SEED = 31
-CMA_PREDICTIVE_MAXITER = 40
-CMA_PREDICTIVE_MAXFEVALS = 1000
-CMA_PREDICTIVE_POPSIZE = 12
+# Env-configurable so HPC/local sweep scripts can vary the CMA-ES budget
+# (effective evaluations ~= CMA_PREDICTIVE_MAXITER * CMA_PREDICTIVE_POPSIZE,
+# since maxiter binds before maxfevals at these defaults) without editing this
+# file per run.
+CMA_PREDICTIVE_MAXITER = int(os.environ.get("CMA_PREDICTIVE_MAXITER", "45"))
+CMA_PREDICTIVE_MAXFEVALS = int(os.environ.get("CMA_PREDICTIVE_MAXFEVALS", "1000"))
+CMA_PREDICTIVE_POPSIZE = int(os.environ.get("CMA_PREDICTIVE_POPSIZE", "12"))
 
 # Per-axis initial CMA-ES step sizes for cma_es_refine_waypoints_3d, replacing a
 # single flat sigma0. Following Popovic et al. (2020)'s own step-size tuning
@@ -345,7 +349,7 @@ def sampler(cx, cy, X, Y, P_history, samplestep):
 
 #importance_filter returns variance form for easy utility deduction!
 ##LOWER CONFIDENCE BOUND!!
-def importance_filter(mu, P, beta, threshold = 0.2, eps=1e-12): 
+def importance_filter(mu, P, beta, threshold = 0.5, eps=1e-12):
 
 
     sigma = np.sqrt(np.diag(P))
@@ -1306,7 +1310,7 @@ def kalman_update(mu, P, sensor, z_meas, R, block_ids=None):
     return mu, P
 
 
-def initialize_gp(sigma2=0.109**2, lengthscale=17.09, xmin=0.0, xmax=100.0, ymin=0.0, ymax=100.0):
+def initialize_gp(sigma2=0.05, lengthscale=6.08, xmin=0.0, xmax=100.0, ymin=0.0, ymax=100.0):
     kernel = ConstantKernel(
         sigma2, constant_value_bounds="fixed"
     ) * Matern(
