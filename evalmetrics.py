@@ -1,5 +1,5 @@
 import numpy as np
-LCB = False
+LCB = False  # must stay in sync with gaussianprocesstraining.py's LCB - unsynced copy, no shared import
 
 def compute_task_completion(
     pos_history,
@@ -92,8 +92,8 @@ def compute_reconstruction_rmse(
         pts: Array with columns [x, y, true_count].
         xs, ys: Grid coordinate axes used by the planner.
         step: Grid spacing.
-        utility_threshold: Ground-truth values below this threshold are treated
-            as occupied cells for the targeted reconstruction metric.
+        utility_threshold: Ground-truth cutoff used with the configured LCB/UCB
+            direction for the targeted reconstruction metric.
         xmin, ymin: Optional grid origin. Defaults to xs.min(), ys.min().
 
     Returns:
@@ -163,6 +163,30 @@ def compute_rmse_time_metrics(rmse_values, dt=1.0):
         "final_rmse": float(rmse_values[-1]),
         "mean_rmse": float(np.mean(rmse_values)),
         "auc_rmse": float(np.trapezoid(rmse_values, dx=dt)),
+    }
+
+
+def compute_variance_time_metrics(variance_values, dt=1.0):
+    """Summarize a variance-over-time curve (e.g. occupied-region Tr(P)).
+
+    Same convention as compute_rmse_time_metrics: auc_variance is the raw
+    trapezoidal integral over elapsed time (variance * time units), NOT
+    divided by the time span - it is not normalized, so runs covering more
+    timesteps naturally accumulate a larger value. Lower still means
+    variance stayed lower for more of the flight.
+    """
+    variance_values = np.asarray(variance_values, dtype=float)
+    if variance_values.size == 0:
+        return {
+            "final_variance": 0.0,
+            "mean_variance": 0.0,
+            "auc_variance": 0.0,
+        }
+
+    return {
+        "final_variance": float(variance_values[-1]),
+        "mean_variance": float(np.mean(variance_values)),
+        "auc_variance": float(np.trapezoid(variance_values, dx=dt)),
     }
 
 

@@ -47,12 +47,12 @@ from sample_3d_sparse_trans_diffusion import diffusion, load_model, sample_spars
 
 from Diffusionplanner_singlemap import apply_measurement_update_3d, build_true_map_flat
 SENSORNOISE_SEED = 123
-MAPTYPE = os.environ.get("MAPTYPE", "NAIP")
+MAPTYPE = os.environ.get("MAPTYPE", "grf")
 CSV_PATH = SCRIPT_DIR / "csv"
 TRUE_MAP_CACHE = {}
 
 beta = 1.0
-utility_threshold = 0.3
+utility_threshold = 0.5
 samplestep = 2.0
 execution_steps_for_reward = 40
 

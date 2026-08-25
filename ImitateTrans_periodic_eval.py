@@ -43,15 +43,15 @@ from gaussianprocesstraining import (
     noise_model,
     sample_correlated_sensor_noise,
 )
-from evalmetrics import compute_reconstruction_rmse
+from evalmetrics import compute_reconstruction_rmse, compute_variance_time_metrics
 from CMAES_classic_singlemap import compute_fov, dynamics_3d, waypoint_3d
 
 EVAL_EVERY = int(os.environ.get("EVAL_EVERY", 10))
-EVAL_MAPTYPE = os.environ.get("EVAL_MAPTYPE", "NAIP")
+EVAL_MAPTYPE = os.environ.get("EVAL_MAPTYPE", "grf")
 EVAL_MAP_OVERRIDE = os.environ.get("EVAL_MAP")  # None -> resolved to a held-out val map_id
-EVAL_TIMEALLOTED = 200
-EVAL_EXECUTION_CHUNK = 10
-EVAL_UTILITY_THRESHOLD = 0.3
+EVAL_TIMEALLOTED = 150
+EVAL_EXECUTION_CHUNK = 40
+EVAL_UTILITY_THRESHOLD = 0.5
 EVAL_ANGLE_OF_VIEW = 60.0
 EVAL_INIT_ALTITUDE = 10.0
 EVAL_SENSORNOISE_SEED = 123
@@ -77,6 +77,7 @@ Input conditioning:
 - current-position marker map (XY only)
 - current position coordinates (XYZ)
 - initial heading velocity (XYZ)
+- log total GP variance scalar
 
 Target:
 - normalized control waypoints shaped [B, 3, 8]
@@ -103,7 +104,7 @@ TOKEN_SPATIAL_DISC = 12
 
 
 
-DATASET_PATH = SCRIPT_DIR / "parallel_randomstart_dataset.pt"
+DATASET_PATH = SCRIPT_DIR / "dataset_grf_60.pt"
 data_dict = torch.load(
     DATASET_PATH,
     map_location="cpu",
@@ -438,6 +439,25 @@ mean_center = means.mean()
 mean_scale = means.std().clamp_min(1e-6)
 var_center = vars.mean()
 var_scale = vars.std().clamp_min(1e-6)
+raw_total_variances = vars.flatten(1).sum(dim=1, keepdim=True)
+total_variance_log = torch.log1p(raw_total_variances.clamp_min(0.0))
+total_variance_center = total_variance_log.mean()
+total_variance_scale = total_variance_log.std().clamp_min(1e-6)
+total_variance_conditions = (
+    total_variance_log - total_variance_center
+) / total_variance_scale
+
+
+def normalize_total_variance(total_variance):
+    total_variance = torch.as_tensor(total_variance, dtype=torch.float32)
+    if total_variance.ndim == 0:
+        total_variance = total_variance.view(1, 1)
+    elif total_variance.ndim == 1:
+        total_variance = total_variance.unsqueeze(-1)
+    total_variance_log = torch.log1p(total_variance.clamp_min(0.0))
+    return (
+        total_variance_log - total_variance_center.to(total_variance.device)
+    ) / total_variance_scale.to(total_variance.device)
 
 means = (means - mean_center) / mean_scale
 vars = (vars - var_center) / var_scale
@@ -449,6 +469,7 @@ if INDEX is not None and INDEX > 0:
     trajectories = trajectories[:INDEX]
     conditions = conditions[:INDEX]
     initial_heading_velocities = initial_heading_velocities[:INDEX]
+    total_variance_conditions = total_variance_conditions[:INDEX]
     means = means[:INDEX]
     vars = vars[:INDEX]
     rmsedrop = rmsedrop[:INDEX]
@@ -466,6 +487,7 @@ class TrajectoryDataset(Dataset):
         meanvarmarkermaps=meanvarmarkermaps,
         conditions=None,
         initial_heading_velocities=None,
+        total_variance_conditions=None,
     ):
         self.trajectories = trajectories
         self.weights = weights
@@ -473,6 +495,7 @@ class TrajectoryDataset(Dataset):
         self.conditions = conditions
         self.meanvarmarkermaps = meanvarmarkermaps
         self.initial_heading_velocities = initial_heading_velocities
+        self.total_variance_conditions = total_variance_conditions
 
     def __len__(self):
         return len(self.trajectories)
@@ -484,11 +507,20 @@ class TrajectoryDataset(Dataset):
             initial_heading_velocity = torch.zeros_like(self.conditions[idx])
         else:
             initial_heading_velocity = self.initial_heading_velocities[idx]
+        if self.total_variance_conditions is None:
+            total_variance_condition = torch.zeros(
+                1,
+                dtype=self.trajectories.dtype,
+                device=self.trajectories.device,
+            )
+        else:
+            total_variance_condition = self.total_variance_conditions[idx]
         return (
             self.trajectories[idx],
             self.conditions[idx],
             self.meanvarmarkermaps[idx],
             initial_heading_velocity,
+            total_variance_condition,
             self.weights[idx],
         )
 
@@ -695,8 +727,16 @@ class WPTokenization(nn.Module):
         self.final_norm = nn.LayerNorm(token_dim)
         self.current_pos_mlp = nn.Sequential(nn.Linear(NUM_COORDS, token_dim), nn.SiLU(), nn.Linear(token_dim, token_dim))
         self.heading_mlp = nn.Sequential(nn.Linear(NUM_COORDS, token_dim), nn.SiLU(), nn.Linear(token_dim, token_dim))
+        self.total_variance_mlp = nn.Sequential(nn.Linear(1, token_dim), nn.SiLU(), nn.Linear(token_dim, token_dim))
+        nn.init.zeros_(self.total_variance_mlp[-1].weight)
+        nn.init.zeros_(self.total_variance_mlp[-1].bias)
 
-    def forward(self, current_position, initial_heading_velocity=None):
+    def forward(
+        self,
+        current_position,
+        initial_heading_velocity=None,
+        total_variance_condition=None,
+    ):
         """
         x: [B, 3, 8]
         returns: [B, 8, token_dim], one token per waypoint.
@@ -720,8 +760,25 @@ class WPTokenization(nn.Module):
         heading_tokens = self.heading_mlp(initial_heading_velocity) # [B, token_dim]
         heading_tokens = heading_tokens.unsqueeze(1) # [B, 1, token_dim]
 
+        if total_variance_condition is None:
+            total_variance_condition = torch.zeros(
+                current_position.shape[0],
+                1,
+                device=current_position.device,
+                dtype=current_position.dtype,
+            )
+        total_variance_condition = total_variance_condition.to(
+            device=current_position.device,
+            dtype=current_position.dtype,
+        )
+        if total_variance_condition.ndim == 1:
+            total_variance_condition = total_variance_condition.unsqueeze(-1)
+        total_variance_tokens = self.total_variance_mlp(total_variance_condition) # [B, token_dim]
+        total_variance_tokens = total_variance_tokens.unsqueeze(1) # [B, 1, token_dim]
+
         waypoint_tokens = waypoint_tokens + current_pos_tokens # add current position embedding to each waypoint token
         waypoint_tokens = waypoint_tokens + heading_tokens # add initial heading velocity embedding to each waypoint token
+        waypoint_tokens = waypoint_tokens + total_variance_tokens # add total GP uncertainty embedding to each waypoint token
 
         waypoint_tokens = self.final_norm(waypoint_tokens) # normalize across token_dim for each token
         
@@ -874,9 +931,19 @@ class WaypointPredictor(nn.Module):
         # nn.init.zeros_(self.output.bias)
 
 
-    def forward(self, meanvarmarker_map, current_position=None, initial_heading_velocity=None):
+    def forward(
+        self,
+        meanvarmarker_map,
+        current_position=None,
+        initial_heading_velocity=None,
+        total_variance_condition=None,
+    ):
         map_tokens = self.mean_var_marker_cnn(meanvarmarker_map) # [B, 144, token_dim]
-        wp_tokens = self.wp_tokenization(current_position, initial_heading_velocity) # [B, 8, token_dim]
+        wp_tokens = self.wp_tokenization(
+            current_position,
+            initial_heading_velocity,
+            total_variance_condition,
+        ) # [B, 8, token_dim]
         for attention_block in self.attention_blocks:
             wp_tokens = attention_block(wp_tokens, map_tokens) # [B, 8, token_dim]
         WP_pred = self.output(wp_tokens) # [B, 8, 3]
@@ -903,6 +970,25 @@ def remap_legacy_state_dict_keys(state_dict):
     return remapped
 
 
+def load_model_state_dict_compatible(model, state_dict):
+    try:
+        return model.load_state_dict(state_dict)
+    except RuntimeError:
+        result = model.load_state_dict(state_dict, strict=False)
+        allowed_prefix = "wp_tokenization.total_variance_mlp."
+        missing_allowed = all(
+            key.startswith(allowed_prefix) for key in result.missing_keys
+        )
+        if result.missing_keys and missing_allowed and not result.unexpected_keys:
+            print(
+                "Loaded checkpoint without total-variance conditioning weights; "
+                "the zero-initialized scalar branch is a no-op until retrained.",
+                flush=True,
+            )
+            return result
+        raise
+
+
 
 def get_loss(
     model,
@@ -910,6 +996,7 @@ def get_loss(
     meanvarmarker_map,
     current_position,
     initial_heading_velocity=None,
+    total_variance_condition=None,
     weights=None,
     alpha=0.0,
 ):
@@ -922,6 +1009,7 @@ def get_loss(
             meanvarmarker_map,
             current_position,
             initial_heading_velocity,
+            total_variance_condition,
         )
     WP_pred = WP_pred.float()
 
@@ -941,8 +1029,14 @@ def sample_plot_traj(output_path=None):
     meanvarmarker_map = meanvarmarkermaps[0:1].to(next(model.parameters()).device)
     current_position = conditions[0:1].to(next(model.parameters()).device)
     initial_heading_velocity = initial_heading_velocities[0:1].to(next(model.parameters()).device)
+    total_variance_condition = total_variance_conditions[0:1].to(next(model.parameters()).device)
 
-    traj = model(meanvarmarker_map, current_position, initial_heading_velocity)
+    traj = model(
+        meanvarmarker_map,
+        current_position,
+        initial_heading_velocity,
+        total_variance_condition,
+    )
 
     traj_to_plot = extract_control_waypoints(traj[0].cpu())
     truth_to_plot = extract_control_waypoints(trajectories[0].cpu())
@@ -1087,6 +1181,9 @@ def sample_imitation_trajectory(
     current_var = torch.tensor(current_var, dtype=torch.float32, device=device)
 
     mean_map = (current_mean - mean_center.to(device)) / mean_scale.to(device)
+    total_variance_condition = normalize_total_variance(
+        current_var.reshape(1, -1).sum(dim=1, keepdim=True)
+    ).to(device)
     var_map = (current_var - var_center.to(device)) / var_scale.to(device)
     marker_map = make_position_marker_maps(
         current_position_world[:, :2].cpu(),
@@ -1107,6 +1204,7 @@ def sample_imitation_trajectory(
         meanvarmarker_map,
         current_position_model,
         initial_heading_velocity,
+        total_variance_condition,
     )
 
     control_waypoints = extract_control_waypoints(normalized_waypoints[0])
@@ -1183,9 +1281,22 @@ def run_single_map_eval(model, eval_env, timealloted=EVAL_TIMEALLOTED):
 
     rng = np.random.default_rng(EVAL_SENSORNOISE_SEED + eval_env["selected_map"])
 
-    mu = np.full(eval_env["X_test"].shape[0], EVAL_UTILITY_THRESHOLD - 0.1)
+    mu = np.full(eval_env["X_test"].shape[0], EVAL_UTILITY_THRESHOLD + 0.1)
     P = cov.copy()
-    initial_total_variance = float(np.sum(np.diag(P)))
+    # Ground-truth "important" cells (value > EVAL_UTILITY_THRESHOLD, GRF/UCB
+    # convention), not the planner's own belief-based importance_filter -
+    # true_map_flat is already aligned to X_test's exact ordering (see
+    # build_true_map_flat), so this mask indexes np.diag(P) directly, same
+    # convention as important_region_variance_from_trajectories.py.
+    important_mask = true_map_flat > EVAL_UTILITY_THRESHOLD
+    initial_total_variance = float(np.sum(np.diag(P)[important_mask]))
+    # Occupied-region variance sampled once per simulation timestep (including
+    # this pre-flight value at ts=0), integrated below via trapz with unit
+    # spacing - there's no real wall-clock dt tracked in this loop (see the
+    # module docstring: no ENFORCE_MIN_STEP_TIME here), so the timestep index
+    # itself is the time axis, same convention evalmetrics.compute_rmse_time_metrics
+    # already uses for the RMSE-over-time AUC in every other _singlemap.py script.
+    occupied_variance_curve = [initial_total_variance]
 
     initial_reconstruction = compute_reconstruction_rmse(
         mu=mu,
@@ -1264,6 +1375,7 @@ def run_single_map_eval(model, eval_env, timealloted=EVAL_TIMEALLOTED):
                 current_heading_velocity = np.array([cx, cy, cz], dtype=np.float32) - previous_pose
 
         mu, P = apply_measurement_update_3d(cx, cy, cz, mu, P, true_map_flat, xs, ys, rng, step)
+        occupied_variance_curve.append(float(np.sum(np.diag(P)[important_mask])))
 
     final_reconstruction = compute_reconstruction_rmse(
         mu=mu,
@@ -1275,7 +1387,12 @@ def run_single_map_eval(model, eval_env, timealloted=EVAL_TIMEALLOTED):
         xmin=xmin,
         ymin=ymin,
     )
-    final_total_variance = float(np.sum(np.diag(P)))
+    final_total_variance = float(np.sum(np.diag(P)[important_mask]))
+    # occupied_variance_curve's last entry was appended right after the same
+    # final apply_measurement_update_3d call above, so this is redundant with
+    # final_total_variance by construction - asserted, not silently assumed.
+    assert occupied_variance_curve[-1] == final_total_variance
+    variance_time_metrics = compute_variance_time_metrics(occupied_variance_curve)
 
     if was_training:
         model.train()
@@ -1283,7 +1400,7 @@ def run_single_map_eval(model, eval_env, timealloted=EVAL_TIMEALLOTED):
     return {
         "global_rmse_drop": initial_reconstruction["global_rmse"] - final_reconstruction["global_rmse"],
         "occupied_rmse_drop": initial_reconstruction["occupied_rmse"] - final_reconstruction["occupied_rmse"],
-        "variance_drop": initial_total_variance - final_total_variance,
+        "occupied_variance_auc": variance_time_metrics["auc_variance"],
         "final_global_rmse": final_reconstruction["global_rmse"],
         "final_occupied_rmse": final_reconstruction["occupied_rmse"],
         "final_variance": final_total_variance,
@@ -1298,12 +1415,14 @@ def train_one_sample(model, steps=3000, batch_size=64):
     x0 = trajectories[:1].to(device)
     pos0 = conditions[:1].to(device)
     heading0 = initial_heading_velocities[:1].to(device)
+    total_variance0 = total_variance_conditions[:1].to(device)
     meanvarmarker_map = meanvarmarkermaps[:1].to(device)
 
     for step in range(steps):
         traj = x0.repeat(batch_size, 1, 1)
         current_position = pos0.repeat(batch_size, 1)
         initial_heading_velocity = heading0.repeat(batch_size, 1)
+        total_variance_condition = total_variance0.repeat(batch_size, 1)
         batch_meanvarmarker_map = meanvarmarker_map.repeat(batch_size, 1, 1, 1)
 
         loss = get_loss(
@@ -1312,6 +1431,7 @@ def train_one_sample(model, steps=3000, batch_size=64):
             batch_meanvarmarker_map,
             current_position,
             initial_heading_velocity,
+            total_variance_condition,
         )
         losses.append(loss.item())
 
@@ -1349,22 +1469,36 @@ def evaluate(model, dataloader):
     model_device = next(model.parameters()).device
 
     for batch in dataloader:
-        if len(batch) == 5:
+        if len(batch) == 6:
+            (
+                traj,
+                current_position,
+                meanvarmarker_map,
+                initial_heading_velocity,
+                total_variance_condition,
+                batch_weights,
+            ) = batch
+        elif len(batch) == 5:
             traj, current_position, meanvarmarker_map, initial_heading_velocity, batch_weights = batch
+            total_variance_condition = None
         else:
             traj, current_position, meanvarmarker_map, batch_weights = batch
             initial_heading_velocity = None
+            total_variance_condition = None
         traj = traj.to(model_device, non_blocking=True)
         current_position = current_position.to(model_device, non_blocking=True)
         meanvarmarker_map = meanvarmarker_map.to(model_device, non_blocking=True)
         if initial_heading_velocity is not None:
             initial_heading_velocity = initial_heading_velocity.to(model_device, non_blocking=True)
+        if total_variance_condition is not None:
+            total_variance_condition = total_variance_condition.to(model_device, non_blocking=True)
         loss = get_loss(
             model,
             traj,
             meanvarmarker_map,
             current_position,
             initial_heading_velocity,
+            total_variance_condition,
         )
         batch_size = traj.shape[0]
         loss_sum += loss.item() * batch_size
@@ -1400,7 +1534,7 @@ def train(
     eval_epochs = []
     eval_global_rmse_drops = []
     eval_occupied_rmse_drops = []
-    eval_variance_drops = []
+    eval_occupied_variance_aucs = []
 
     for epoch in range(epochs):
         print(f"Epoch {epoch + 1}/{epochs}")
@@ -1408,23 +1542,37 @@ def train(
         epoch_sample_count = 0
         for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             stepcount.append(epoch * len(dataloader) + step)
-            if len(batch) == 5:
+            if len(batch) == 6:
+                (
+                    traj,
+                    current_position,
+                    meanvarmarker_map,
+                    initial_heading_velocity,
+                    total_variance_condition,
+                    batch_weights,
+                ) = batch
+            elif len(batch) == 5:
                 traj, current_position, meanvarmarker_map, initial_heading_velocity, batch_weights = batch
+                total_variance_condition = None
             else:
                 traj, current_position, meanvarmarker_map, batch_weights = batch
                 initial_heading_velocity = None
+                total_variance_condition = None
             model_device = next(model.parameters()).device
             traj = traj.to(model_device, non_blocking=True)
             current_position = current_position.to(model_device, non_blocking=True)
             meanvarmarker_map = meanvarmarker_map.to(model_device, non_blocking=True)
             if initial_heading_velocity is not None:
                 initial_heading_velocity = initial_heading_velocity.to(model_device, non_blocking=True)
+            if total_variance_condition is not None:
+                total_variance_condition = total_variance_condition.to(model_device, non_blocking=True)
             loss = get_loss(
                 model,
                 traj,
                 meanvarmarker_map,
                 current_position,
                 initial_heading_velocity,
+                total_variance_condition,
             )
             loss_vals.append(loss.item())
             batch_size = traj.shape[0]
@@ -1475,12 +1623,12 @@ def train(
             eval_epochs.append(epoch + 1)
             eval_global_rmse_drops.append(eval_metrics["global_rmse_drop"])
             eval_occupied_rmse_drops.append(eval_metrics["occupied_rmse_drop"])
-            eval_variance_drops.append(eval_metrics["variance_drop"])
+            eval_occupied_variance_aucs.append(eval_metrics["occupied_variance_auc"])
             print(
                 f"Epoch {epoch + 1} single-map eval (map {eval_env['selected_map']}, "
                 f"{eval_elapsed:.1f}s): global_rmse_drop={eval_metrics['global_rmse_drop']:.4f}, "
                 f"occupied_rmse_drop={eval_metrics['occupied_rmse_drop']:.4f}, "
-                f"variance_drop={eval_metrics['variance_drop']:.4f}",
+                f"occupied_variance_auc={eval_metrics['occupied_variance_auc']:.4f}",
                 flush=True,
             )
 
@@ -1488,10 +1636,10 @@ def train(
             np.savetxt(
                 eval_metrics_path,
                 np.column_stack(
-                    [eval_epochs, eval_global_rmse_drops, eval_occupied_rmse_drops, eval_variance_drops]
+                    [eval_epochs, eval_global_rmse_drops, eval_occupied_rmse_drops, eval_occupied_variance_aucs]
                 ),
                 delimiter=",",
-                header="epoch,global_rmse_drop,occupied_rmse_drop,variance_drop",
+                header="epoch,global_rmse_drop,occupied_rmse_drop,occupied_variance_auc",
                 comments="",
             )
 
@@ -1577,15 +1725,15 @@ def train(
         print(f"Saved periodic eval RMSE drop plot to {rmse_drop_plot_path}")
 
         plt.figure()
-        plt.plot(eval_epochs, eval_variance_drops, marker="o", color="tab:green", label="Variance drop")
+        plt.plot(eval_epochs, eval_occupied_variance_aucs, marker="o", color="tab:green", label="Occupied-area variance AUC")
         plt.xlabel("Epoch")
-        plt.ylabel("Variance drop (initial - final)")
-        plt.title(f"Periodic single-map eval - Variance drop (map {eval_map_id})")
+        plt.ylabel(f"Variance AUC in cells > {EVAL_UTILITY_THRESHOLD} (integral over timesteps, not normalized)")
+        plt.title(f"Periodic single-map eval - Occupied-area variance AUC (map {eval_map_id})")
         plt.legend()
         variance_drop_plot_path = PLOT_DIR / "periodic_eval_variance_drop.png"
         plt.savefig(variance_drop_plot_path, dpi=150, bbox_inches="tight")
         plt.close()
-        print(f"Saved periodic eval variance drop plot to {variance_drop_plot_path}")
+        print(f"Saved periodic eval variance AUC plot to {variance_drop_plot_path}")
 
     sample_plot_traj(PLOT_DIR / "imitate_trans_training_sample.png")
 
@@ -1623,6 +1771,7 @@ if __name__ == "__main__":
         meanvarmarkermaps=meanvarmarkermaps[train_mask],
         conditions=conditions[train_mask],
         initial_heading_velocities=initial_heading_velocities[train_mask],
+        total_variance_conditions=total_variance_conditions[train_mask],
     )
     val_dataset = TrajectoryDataset(
         trajectories[val_mask],
@@ -1630,6 +1779,7 @@ if __name__ == "__main__":
         meanvarmarkermaps=meanvarmarkermaps[val_mask],
         conditions=conditions[val_mask],
         initial_heading_velocities=initial_heading_velocities[val_mask],
+        total_variance_conditions=total_variance_conditions[val_mask],
     )
     val_dataloader_kwargs = dict(dataloader_kwargs)
     val_dataloader_kwargs["shuffle"] = False

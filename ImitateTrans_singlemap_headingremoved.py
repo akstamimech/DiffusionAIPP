@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 import imageio.v2 as imageio
 from matplotlib.patches import Rectangle
+from tqdm import tqdm
 from gaussianprocesstraining import (
     build_correlated_noise_covariance,
     build_sensor_matrix,
@@ -24,119 +25,128 @@ import time
 from CMAES_classic_singlemap import compute_fov, dynamics_3d, waypoint_3d
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DIFFUSION_DIR = SCRIPT_DIR / "Diffusion"
-if str(DIFFUSION_DIR) not in sys.path:
-    sys.path.insert(0, str(DIFFUSION_DIR))
 
-from sample_3d_sparse_trans_diffusion import diffusion
+# ImitateTrans derives every inference normalization statistic from this
+# dataset at import time.  Use the GRF training distribution by default while
+# retaining IMITATE_DATASET_PATH as an explicit override.
+GRF_DATASET_PATH = SCRIPT_DIR / "dataset_grf_60.pt"
+os.environ.setdefault("IMITATE_DATASET_PATH", str(GRF_DATASET_PATH))
+
+import ImitateTrans_headingremoved as imitate_trans
 
 step = 2.0
-timealloted = 150
+timealloted = int(os.environ.get("TIMEALLOTED", "3000"))
 beta = 1.0
 alpha = 0.02
-utility_threshold = 0.5
-planning_horizon = 8
-selected_map = int(os.environ.get("SELECTED_MAP", 22))
+utility_threshold = float(os.environ.get("UTILITY_THRESHOLD", "0.5"))
+planning_horizon = int(os.environ.get("PLANNING_HORIZON", "8"))
+selected_map = int(os.environ.get("SELECTED_MAP", 55))
 samples_per_segment = 5
-execution_chunk = 10
-SENSORNOISE_SEED = 123
-rng = np.random.default_rng(SENSORNOISE_SEED + selected_map)
+execution_chunk = int(os.environ.get("EXECUTION_CHUNK", 40))
+SENSORNOISE_SEED = int(os.environ.get("SENSORNOISE_SEED", "123"))
 MAPTYPE = os.environ.get("MAPTYPE", "grf")
 CHUNK_SIZE = 256
 CHUNK_PREFIX = "./trajectory_dataset_chunk"
+WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "150"))  # <=0 = unconstrained (timestep
+                                                                      # loop runs to completion); otherwise
+                                                                      # the flight ends at timealloted
+                                                                      # timesteps OR this many real
+                                                                      # seconds, whichever comes first
 
-diffusion_path = DIFFUSION_DIR / "checkpoints" / "sparse_trans_waypoints_epoch_1900_multimodal_full.pth"
+# Each simulation step is 1 vector step, treated as 1 meter of real flight. At
+# a flight speed of FLIGHT_SPEED_MPS, that step physically takes at least
+# STEP_DISTANCE_METERS / FLIGHT_SPEED_MPS seconds. When ENFORCE_MIN_STEP_TIME
+# is on, a step that computed (dynamics + any replan + sensor update) faster
+# than that gets padded with a sleep up to the floor; a step that already took
+# longer is left alone - this is a floor, not a fixed duration.
+ENFORCE_MIN_STEP_TIME = os.environ.get("ENFORCE_MIN_STEP_TIME", "1") == "1"
+STEP_DISTANCE_METERS = 1.0
+FLIGHT_SPEED_MPS = 3.0
+MIN_STEP_SECONDS = STEP_DISTANCE_METERS / FLIGHT_SPEED_MPS
+
+# NOTE: this checkpoint must come from the current (3D) ImitateTrans.py architecture -
+# checkpoints saved before the 2D -> 3D port (e.g. imitate_trans_waypoints_epoch_1600.pth)
+# will not load into WaypointPredictor and need to be retrained.
+imitate_checkpoint_path = Path(
+    os.environ.get(
+        "IMITATE_CHECKPOINT",
+        # str(SCRIPT_DIR / "checkpoints" / "Imitate_best.pth"),
+        str(SCRIPT_DIR / "checkpoints" / "imitate_trans_waypoints_epoch_1500_headingremoved.pth")
+    )
+)
 INIT_ALTITUDE = 10.0
-ZMIN = diffusion.Z_MIN
-ZMAX = diffusion.Z_MAX
+ZMIN = imitate_trans.Z_MIN
+ZMAX = imitate_trans.Z_MAX
 ANGLE_OF_VIEW = 60.0
+START_X = float(os.environ.get("START_X", "4.0"))
+START_Y = float(os.environ.get("START_Y", "4.0"))
 
 """
-Single-map diffusion verification copy of receding_gridsearch_diffusion.py.
+Single-map verification copy of receding_gridsearch_diffusion.py, using the direct
+(non-diffusion) ImitateTrans waypoint predictor in place of the denoising sampler.
 This script runs one chosen map and reports task completion after a single execution.
 """
 
 
-def load_diffusion_model(checkpoint_path=None):
-    model = diffusion.NoisePredictor().to(diffusion.device)
+def load_imitate_model(checkpoint_path=None):
+    model = imitate_trans.WaypointPredictor().to(imitate_trans.device)
     if checkpoint_path is not None:
         checkpoint = torch.load(
             checkpoint_path,
-            map_location=diffusion.device,
+            map_location=imitate_trans.device,
             weights_only=True,
         )
         state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-        state_dict = diffusion.remap_legacy_state_dict_keys(state_dict)
-        model.load_state_dict(state_dict)
+        state_dict = imitate_trans.remap_legacy_state_dict_keys(state_dict)
+        imitate_trans.load_model_state_dict_compatible(model, state_dict)
     model.eval()
-    diffusion.model = model
+    imitate_trans.model = model
     return model
 
 
 @torch.no_grad()
-def sample_diffusion_trajectory(
+def sample_imitation_trajectory(
     model,
     current_position,
     current_mean,
     current_var,
-    current_heading_velocity=None,
     grid_step=step,
     bounds=None,
-    num_steps=None,
-    clip_x0=True
 ):
     model.eval()
-    diffusion.model = model
+    imitate_trans.model = model
 
     current_position_world = torch.as_tensor(
-        current_position, dtype=torch.float32, device=diffusion.device
+        current_position, dtype=torch.float32, device=imitate_trans.device
     ).view(1, 3)
-    current_position_model = diffusion.normalize_xyz(current_position_world)
+    current_position_model = imitate_trans.normalize_xyz(current_position_world)
 
-    current_mean = torch.tensor(current_mean, dtype=torch.float32, device=diffusion.device)
-    current_var = torch.tensor(current_var, dtype=torch.float32, device=diffusion.device)
+    current_mean = torch.tensor(current_mean, dtype=torch.float32, device=imitate_trans.device)
+    current_var = torch.tensor(current_var, dtype=torch.float32, device=imitate_trans.device)
 
-    mean_map = (current_mean - diffusion.mean_center.to(diffusion.device)) / diffusion.mean_scale.to(diffusion.device)
-    var_map = (current_var - diffusion.var_center.to(diffusion.device)) / diffusion.var_scale.to(diffusion.device)
-    marker_map = diffusion.make_position_marker_maps(
+    mean_map = (current_mean - imitate_trans.mean_center.to(imitate_trans.device)) / imitate_trans.mean_scale.to(imitate_trans.device)
+    total_variance_condition = imitate_trans.normalize_total_variance(
+        current_var.reshape(1, -1).sum(dim=1, keepdim=True)
+    ).to(imitate_trans.device)
+    var_map = (current_var - imitate_trans.var_center.to(imitate_trans.device)) / imitate_trans.var_scale.to(imitate_trans.device)
+    marker_map = imitate_trans.make_position_marker_maps(
         current_position_world[:, :2].cpu(),
         grid_size=51,
         marker_radius=2,
-    ).to(diffusion.device)[0, 0]
+    ).to(imitate_trans.device)[0, 0]
     meanvarmarker_map = torch.stack([mean_map, var_map, marker_map], dim=0).unsqueeze(0)
 
-    if current_heading_velocity is None:
-        initial_heading_velocity = torch.zeros(
-            (1, 3),
-            dtype=torch.float32,
-            device=diffusion.device,
-        )
-    else:
-        current_heading_velocity = torch.as_tensor(
-            current_heading_velocity,
-            dtype=torch.float32,
-            device=diffusion.device,
-        ).view(1, 3)
-        initial_heading_velocity = diffusion.normalize_xyz_displacement(
-            current_heading_velocity
-        )
-
-    sparse_noise = torch.randn((1, *diffusion.TARGET_SHAPE), device=diffusion.device)
-    sparse_sample = diffusion.ddim_sample(
-        sparse_noise,
+    normalized_waypoints = model(
         meanvarmarker_map,
-        current_position=current_position_model,
-        initial_heading_velocity=initial_heading_velocity,
-        num_steps=num_steps,
-        clip_x0=clip_x0,
+        current_position_model,
+        total_variance_condition,
     )
 
-    control_waypoints = diffusion.extract_control_waypoints(sparse_sample[0])
-    dense_traj = diffusion.pytorch_cubic_spline(
+    control_waypoints = imitate_trans.extract_control_waypoints(normalized_waypoints[0])
+    dense_traj = imitate_trans.pytorch_cubic_spline(
         control_waypoints,
         current_position=current_position_world[0],
     )[0]
-    dense_traj = grid_step * torch.round(dense_traj / grid_step)
     if bounds is not None:
         xmin, xmax, ymin, ymax, zmin, zmax = bounds
         padding = grid_step * 2
@@ -201,40 +211,6 @@ def apply_measurement_update_3d(cx, cy, cz, mu, P, true_map_flat, xs, ys, rng):
         noise_covariance,
         block_ids=block_ids,
     )
-
-
-# def receding_horizon_planner(cx, cy, sorted_util_values, alpha, horizon=planning_horizon):
-#     flight_plan = []
-#     for _ in range(horizon + 1):
-#         updated_utils = []
-#         for util, (x, y) in sorted_util_values:
-#             dist = np.hypot(x - cx, y - cy)
-
-#             if dist == 0:
-#                 dist = 1e-6
-
-#             new_util = util * np.exp(-alpha * dist)
-#             updated_utils.append((new_util, (x, y)))
-
-#         sorted_util_values = sorted(updated_utils, key=lambda x: x[0], reverse=True)
-
-#         best_coord = sorted_util_values[0][1]
-#         best_coord = (
-#             step * np.round(best_coord[0] / step),
-#             step * np.round(best_coord[1] / step),
-#         )
-
-#         flight_plan.append(best_coord)
-
-#         cx, cy = best_coord
-#         sorted_util_values.pop(0)
-
-#     return flight_plan
-
-
-
-# def true_receding_horizon(cx, cy, sorted_util_values, alpha=alpha, horizon=planning_horizon):
-#     ...
 
 
 def waypoint(cx, cy, goal_x, goal_y, step):
@@ -308,26 +284,23 @@ def finalize_chunks(num_chunks, final_path="./trajectory_dataset.pt"):
 
 
 if __name__ == "__main__":
-
-    """
-    Map loading
-    """
-
-    csv_path = r"C:\Users\Aksha\OneDrive\Year 6\Thesis\scripts\csv"
-    # output_dir = Path(__file__).resolve().parent / "Vizualization" / f"diffusion_map_{selected_map}_viz"
-    output_dir = Path(__file__).resolve().parent / "Vizualization" / f"diffusion_map_{MAPTYPE}_{selected_map}_viz"
+    csv_path = Path(os.environ.get("CSV_DIR", str(SCRIPT_DIR / "csv")))
+    output_name = f"imitate_trans_map_{MAPTYPE}_{selected_map}_viz"
+    run_output_tag = os.environ.get("RUN_OUTPUT_TAG")
+    if run_output_tag:
+        output_name = f"{output_name}_{run_output_tag}"
+    results_root = Path(os.environ.get("RESULTS_ROOT", str(SCRIPT_DIR / "Vizualization")))
+    output_dir = results_root / output_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    imitate_model = load_imitate_model(checkpoint_path=imitate_checkpoint_path)
+
     data = np.loadtxt(
-        rf"{csv_path}/map_{selected_map}_{MAPTYPE}_grid_counts.csv",
+        csv_path / f"map_{selected_map}_{MAPTYPE}_grid_counts.csv",
         delimiter=",",
         skiprows=1,
     )
 
-
-    """
-    Internal map representation initialization + data collection lists
-    """
     gp, X_test, mean, cov, xs, ys, X, Y, xmin, xmax, ymin, ymax, step = initialize_gp()
 
     pts = data[:, 0:3]
@@ -340,7 +313,11 @@ if __name__ == "__main__":
 
     N = X_test.shape[0]
     true_map_flat = build_true_map_flat(pts, X_test)
-    mean = np.full(X_test.shape[0], utility_threshold + 0.1)  # UCB/grf: optimistic prior
+
+    rng = np.random.default_rng(SENSORNOISE_SEED + selected_map)
+
+    # Under GRF/UCB, the optimistic prior starts above the importance threshold.
+    mean = np.full(X_test.shape[0], utility_threshold + 0.1)
     mu = mean.copy()
     P = cov.copy()
 
@@ -356,48 +333,65 @@ if __name__ == "__main__":
     pose_history = []
     altitude_history = []
 
-    mu_history.append(mu.copy())
-    P_history.append(P.copy())
+    collect_viz_history = os.environ.get("SKIP_VIZ", "0") != "1"
+    if collect_viz_history:
+        mu_history.append(mu.copy())
+        P_history.append(P.copy())
     step_numbers.append(0)
     planned_path_history.append([])
     control_waypoint_history.append([])
 
     initial_utility = importance_filter(mu, P, beta, threshold=utility_threshold)
-    utility_history.append(initial_utility.copy())
+    if collect_viz_history:
+        utility_history.append(initial_utility.copy())
 
     save_every = 5
     lateral_coverage = step * 2
     samplestep = step
 
-    cx, cy, cz = 4.0, 4.0, INIT_ALTITUDE
+    cx, cy, cz = START_X, START_Y, INIT_ALTITUDE
     grad_x, grad_y, grad_z = 0.0, 0.0, 0.0
-    current_heading_velocity = np.zeros(3, dtype=np.float32)
     pos_history.append((cx, cy))
     pose_history.append((cx, cy, cz))
     altitude_history.append(cz)
 
     initial_var_field = np.diag(P).reshape(X.shape)
-    gy0, gx0 = np.gradient(initial_var_field, Y[:, 0], X[0, :])
-    grad_history.append((gx0, gy0))
-    sorted_util_values_list.append(grid_measure(initial_utility, xs, ys))
+    if collect_viz_history:
+        gy0, gx0 = np.gradient(initial_var_field, Y[:, 0], X[0, :])
+        grad_history.append((gx0, gy0))
+        sorted_util_values_list.append(grid_measure(initial_utility, xs, ys))
 
     initial_total_variance = np.sum(np.diag(P))
-    print(f"Initial total variance: {initial_total_variance:.4f}")
+    variance_history = [initial_total_variance]
+    print(f"Map {selected_map}: Initial total variance: {initial_total_variance:.4f}")
 
     utility = initial_utility
-    diffusion_model = load_diffusion_model(checkpoint_path=diffusion_path)
     spline_path = []
     spline_idx = 0
     control_waypoints = []
     rmselist = []
     global_rmselist = []
+    wall_time_history = []
 
-
-    """
-    Simulation loop
-    """
+    # WALLCLOCK_SECONDS<=0 means unconstrained: the loop below only ever stops
+    # because ts reached timealloted. Otherwise this flight ends either when
+    # the timestep loop naturally finishes or when WALLCLOCK_SECONDS of real
+    # time have elapsed since the flight started, whichever comes first.
+    unconstrained = WALLCLOCK_SECONDS <= 0
+    flight_start_time = time.time()
+    stopped_early = False
 
     for ts in range(0, timealloted):
+        if not unconstrained and (time.time() - flight_start_time) >= WALLCLOCK_SECONDS:
+            stopped_early = True
+            print(
+                f"Map {selected_map}: wall-clock budget reached at timestep {ts} "
+                f"(of {timealloted}); ending the flight early."
+            )
+            break
+
+        step_start_time = time.time()
+
         if ts <= 1:
             grad_x, grad_y, grad_z, _ = waypoint_3d(
                 cx,
@@ -408,7 +402,6 @@ if __name__ == "__main__":
                 goal_z=INIT_ALTITUDE,
                 step=step,
             )
-            previous_pose = np.array([cx, cy, cz], dtype=np.float32)
             cx, cy, cz = dynamics_3d(
                 cx,
                 cy,
@@ -425,9 +418,6 @@ if __name__ == "__main__":
                 ZMAX,
                 buffer=step * 2,
             )
-            current_heading_velocity = (
-                np.array([cx, cy, cz], dtype=np.float32) - previous_pose
-            )
             pos_history.append((cx, cy))
             pose_history.append((cx, cy, cz))
             altitude_history.append(cz)
@@ -439,15 +429,11 @@ if __name__ == "__main__":
                 current_mean = mu.reshape(X.shape)
                 current_var = np.diag(P).reshape(X.shape)
                 start_time = time.time()
-                """
-                Diffusion sampling done here
-                """
-                dense_traj, sparse_controls = sample_diffusion_trajectory(
-                    diffusion_model,
+                dense_traj, sparse_controls = sample_imitation_trajectory(
+                    imitate_model,
                     current_position=(cx, cy, cz),
                     current_mean=current_mean,
                     current_var=current_var,
-                    current_heading_velocity=current_heading_velocity,
                     grid_step=step,
                     bounds=(xmin, xmax, ymin, ymax, ZMIN, ZMAX),
                 )
@@ -458,7 +444,7 @@ if __name__ == "__main__":
                 print("Replanning...")
                 print("Control waypoints:", control_waypoints)
                 print(f"Replanning time: {end_time - start_time:.4f} seconds")
-    
+
             if spline_idx < len(spline_path):
                 goal_x, goal_y, goal_z = spline_path[spline_idx]
                 grad_x, grad_y, grad_z, waypoint_reached = waypoint_3d(
@@ -505,7 +491,6 @@ if __name__ == "__main__":
                         ]
                         print("Flight plan waypoint was out of bounds and was clamped back into the padded map region.")
 
-                previous_pose = np.array([cx, cy, cz], dtype=np.float32)
                 cx, cy, cz = dynamics_3d(
                     cx,
                     cy,
@@ -521,9 +506,6 @@ if __name__ == "__main__":
                     ZMIN,
                     ZMAX,
                     buffer=step / 2,
-                )
-                current_heading_velocity = (
-                    np.array([cx, cy, cz], dtype=np.float32) - previous_pose
                 )
                 pos_history.append((cx, cy))
                 pose_history.append((cx, cy, cz))
@@ -555,14 +537,16 @@ if __name__ == "__main__":
             rng,
         )
         utility = importance_filter(mu, P, beta, threshold=utility_threshold)
-        mu_history.append(mu.copy())
-        P_history.append(P.copy())
-        utility_history.append(utility.copy())
-        sorted_util_values_list.append(grid_measure(utility, xs, ys))
+        variance_history.append(float(np.sum(np.diag(P))))
+        if collect_viz_history:
+            mu_history.append(mu.copy())
+            P_history.append(P.copy())
+            utility_history.append(utility.copy())
+            sorted_util_values_list.append(grid_measure(utility, xs, ys))
 
-        var_field = np.diag(P).reshape(X.shape)
-        gy, gx = np.gradient(var_field, Y[:, 0], X[0, :])
-        grad_history.append((gx, gy))
+            var_field = np.diag(P).reshape(X.shape)
+            gy, gx = np.gradient(var_field, Y[:, 0], X[0, :])
+            grad_history.append((gx, gy))
 
         util = utility.reshape(len(ys), len(xs))
 
@@ -579,58 +563,126 @@ if __name__ == "__main__":
 
         rmselist.append(reconstruction_metrics["occupied_rmse"])
         global_rmselist.append(reconstruction_metrics["global_rmse"])
+        if ENFORCE_MIN_STEP_TIME:
+            step_elapsed = time.time() - step_start_time
+            if step_elapsed < MIN_STEP_SECONDS:
+                time.sleep(MIN_STEP_SECONDS - step_elapsed)
 
-    rmse_trace = np.column_stack([global_rmselist, rmselist])
+        wall_time_history.append(time.time() - flight_start_time)
+
+    if not rmselist:
+        raise SystemExit(
+            f"Map {selected_map}: WALLCLOCK_SECONDS={WALLCLOCK_SECONDS} was too small "
+            f"for even one timestep to complete; nothing to plot or save."
+        )
+
+    timestep_index = np.asarray(step_numbers[1:], dtype=int)
+    wall_time_arr = np.asarray(wall_time_history, dtype=float)
+    variancelist = variance_history
+    variance_per_step = np.asarray(variancelist[1:], dtype=float)
+
+    metrics_trace = np.column_stack(
+        [timestep_index, wall_time_arr, global_rmselist, rmselist, variance_per_step]
+    )
     np.savetxt(
         output_dir / f"map_{selected_map}_rmse_over_time.csv",
-        rmse_trace,
+        metrics_trace,
         delimiter=",",
-        header="global_rmse,occupied_rmse",
+        header="timestep,wall_time_seconds,global_rmse,occupied_rmse,global_variance",
+        comments="",
+    )
+    pose_trace = np.column_stack(
+        [
+            np.asarray(step_numbers, dtype=int),
+            np.concatenate(([0.0], wall_time_arr)),
+            np.asarray(pose_history, dtype=float),
+        ]
+    )
+    np.savetxt(
+        output_dir / f"map_{selected_map}_executed_trajectory.csv",
+        pose_trace,
+        delimiter=",",
+        header="timestep,wall_time_seconds,x,y,z",
         comments="",
     )
 
     plt.figure()
-    plt.plot(global_rmselist, label="Global RMSE")
-    plt.plot(rmselist, label="Occupied RMSE")
+    plt.plot(timestep_index, global_rmselist, label="Global RMSE")
+    plt.plot(timestep_index, rmselist, label="Occupied RMSE")
     plt.xlabel("Timestep")
     plt.ylabel("RMSE")
-    plt.title(f"Map {selected_map} - Diffusion RMSE over Time")
+    plt.title(f"Map {selected_map} - ImitateTrans RMSE over Timesteps")
     plt.legend()
     plt.savefig(output_dir / f"map_{selected_map}_rmse_over_time.png")
     plt.close()
 
-    final_variance = np.sum(np.diag(P))
-    print(f"Final total variance: {final_variance:.4f}")
-    variance_delta = initial_total_variance - final_variance
-    print(f"Variance reduction: {variance_delta:.4f}")
+    plt.figure()
+    plt.plot(wall_time_arr, global_rmselist, label="Global RMSE")
+    plt.plot(wall_time_arr, rmselist, label="Occupied RMSE")
+    plt.xlabel("Wall-clock time (s)")
+    plt.ylabel("RMSE")
+    plt.title(f"Map {selected_map} - ImitateTrans RMSE over Wall Time")
+    plt.legend()
+    plt.savefig(output_dir / f"map_{selected_map}_rmse_over_walltime.png")
+    plt.close()
 
-    create_plots_and_gifs(
-        str(output_dir),
-        mu_history,
-        P_history,
-        step_numbers,
-        grad_history,
-        pos_history,
-        utility_history,
-        sorted_util_values_list,
-        X,
-        Y,
-        xs,
-        ys,
-        cx,
-        cy,
-        lateral_coverage,
-        xmin,
-        xmax,
-        ymin,
-        ymax,
-        plot_utility=True,
-        plot_grad=False,
-        planned_path_history=planned_path_history,
-        control_waypoint_history=control_waypoint_history,
-        pose_history=pose_history,
-        angle_of_view=ANGLE_OF_VIEW,
-    )
+    plt.figure()
+    plt.plot(variancelist, label="Global Variance")
+    plt.xlabel("Timestep")
+    plt.ylabel("Global Variance")
+    plt.title(f"Map {selected_map} - ImitateTrans Variance over Timesteps")
+    plt.legend()
+    plt.savefig(output_dir / f"map_{selected_map}_var.png")
+    plt.close()
+
+    plt.figure()
+    plt.plot(wall_time_arr, variance_per_step, label="Global Variance")
+    plt.xlabel("Wall-clock time (s)")
+    plt.ylabel("Global Variance")
+    plt.title(f"Map {selected_map} - ImitateTrans Variance over Wall Time")
+    plt.legend()
+    plt.savefig(output_dir / f"map_{selected_map}_var_walltime.png")
+    plt.close()
+
+    final_variance = np.sum(np.diag(P))
+    variance_delta = initial_total_variance - final_variance
+    print(f"Map {selected_map}: Final total variance: {final_variance:.4f}")
+    print(f"Map {selected_map}: Variance reduction: {variance_delta:.4f}")
+    if stopped_early:
+        print(
+            f"Map {selected_map}: flight ended early after "
+            f"{time.time() - flight_start_time:.1f}s due to the wall-clock budget "
+            f"(completed {len(rmselist)} of {timealloted} timesteps)."
+        )
+
+    if os.environ.get("SKIP_VIZ", "0") != "1":
+        create_plots_and_gifs(
+            str(output_dir),
+            mu_history,
+            P_history,
+            step_numbers,
+            grad_history,
+            pos_history,
+            utility_history,
+            sorted_util_values_list,
+            X,
+            Y,
+            xs,
+            ys,
+            cx,
+            cy,
+            lateral_coverage,
+            xmin,
+            xmax,
+            ymin,
+            ymax,
+            plot_utility=True,
+            plot_grad=False,
+            planned_path_history=planned_path_history,
+            control_waypoint_history=control_waypoint_history,
+            pose_history=pose_history,
+            angle_of_view=ANGLE_OF_VIEW,
+        )
 
     metrics = compute_task_completion(
         pos_history=pos_history,
@@ -643,7 +695,6 @@ if __name__ == "__main__":
         xmin=xmin,
         ymin=ymin,
     )
-
 
     coverage_efficiency = compute_coverage_efficiency(metrics["task_completion"], timealloted+ 1)
     print(f"Map {selected_map}: Gained Utility = {metrics['gained_true_utility']:.4f}, Total Utility = {metrics['total_true_utility']:.4f}, Task Completion = {metrics['task_completion']:.4%}")

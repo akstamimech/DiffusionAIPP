@@ -144,9 +144,9 @@ def _broadcast_module_state(module, comm, mpi_rank):
 # ---------------------------------------------------------------------------
 
 SENSORNOISE_SEED = 123
-MAPTYPE = os.environ.get("MAPTYPE", "NAIP")
+MAPTYPE = os.environ.get("MAPTYPE", "grf")
 CSV_PATH = REPO_DIR / "csv"
-UTILITY_THRESHOLD = 0.3
+UTILITY_THRESHOLD = 0.5
 SAMPLESTEP = 2.0
 
 # T_a in the paper's terms: measurement updates executed per environment step before replanning.

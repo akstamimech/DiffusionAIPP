@@ -24,15 +24,16 @@ from evalmetrics import compute_task_completion, compute_reconstruction_rmse, co
 from CMAES_classic_singlemap import compute_fov, dynamics_3d, waypoint_3d
 import time
 
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 step = 2.0
-timealloted = 200
-beta = 1
-utility_threshold = 0.2
-selected_map = int(os.environ.get("SELECTED_MAP", 23))
-SENSORNOISE_SEED = 123
-MAPTYPE = os.environ.get("MAPTYPE", "multiblob")  # "multiblob" or "NAIP"
-WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "180"))  # <=0 = unconstrained (timestep
+timealloted = int(os.environ.get("TIMEALLOTED", "3000"))
+beta = 1.0
+utility_threshold = float(os.environ.get("UTILITY_THRESHOLD", "0.5"))
+selected_map = int(os.environ.get("SELECTED_MAP", 53))
+SENSORNOISE_SEED = int(os.environ.get("SENSORNOISE_SEED", "123"))
+MAPTYPE = os.environ.get("MAPTYPE", "grf")  # "multiblob" or "NAIP"
+WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "300"))  # <=0 = unconstrained (timestep
                                                                       # loop runs to completion); otherwise
                                                                       # the flight ends at timealloted
                                                                       # timesteps OR this many real
@@ -44,7 +45,7 @@ WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "180"))  # <=0 = u
 # is on, a step that computed (dynamics + sensor update) faster than that gets
 # padded with a sleep up to the floor; a step that already took longer is left
 # alone - this is a floor, not a fixed duration.
-ENFORCE_MIN_STEP_TIME = os.environ.get("ENFORCE_MIN_STEP_TIME", "0") == "1"
+ENFORCE_MIN_STEP_TIME = os.environ.get("ENFORCE_MIN_STEP_TIME", "1") == "1"
 STEP_DISTANCE_METERS = 1.0
 FLIGHT_SPEED_MPS = 3.0
 MIN_STEP_SECONDS = STEP_DISTANCE_METERS / FLIGHT_SPEED_MPS
@@ -103,6 +104,59 @@ def dynamics(cx, cy, grad_x, grad_y, step, samplestep, xmin, xmax, ymin, ymax, b
     return cx, cy
 
 
+def dynamics_3d_with_progress(
+    cx,
+    cy,
+    cz,
+    grad_x,
+    grad_y,
+    grad_z,
+    target_x,
+    target_y,
+    target_z,
+    samplestep,
+    xmin,
+    xmax,
+    ymin,
+    ymax,
+    zmin,
+    zmax,
+    buffer,
+):
+    next_x, next_y, next_z = dynamics_3d(
+        cx,
+        cy,
+        cz,
+        grad_x,
+        grad_y,
+        grad_z,
+        samplestep,
+        xmin,
+        xmax,
+        ymin,
+        ymax,
+        zmin,
+        zmax,
+        buffer=buffer,
+    )
+    if (
+        np.isclose(next_x, cx)
+        and np.isclose(next_y, cy)
+        and np.isclose(next_z, cz)
+        and np.linalg.norm(np.array([target_x - cx, target_y - cy, target_z - cz])) > step
+    ):
+        delta = np.array([target_x - cx, target_y - cy, target_z - cz], dtype=float)
+        axis = int(np.argmax(np.abs(delta)))
+        fallback = np.array([cx, cy, cz], dtype=float)
+        fallback[axis] += step * np.sign(delta[axis])
+        fallback[0] = np.clip(fallback[0], xmin + buffer, xmax - buffer)
+        fallback[1] = np.clip(fallback[1], ymin + buffer, ymax - buffer)
+        fallback[2] = np.clip(fallback[2], zmin, zmax)
+        fallback = step * np.round(fallback / step)
+        next_x, next_y, next_z = fallback.tolist()
+    return next_x, next_y, next_z
+
+
 def replan_target(cx, cy, cz, mu, P, xs, ys):
     start_time = time.time()
     control_waypoints = grid_search_3d(
@@ -113,12 +167,19 @@ def replan_target(cx, cy, cz, mu, P, xs, ys):
         start_pose=(cx, cy, cz),
         beta=beta,
         utility_threshold=utility_threshold,
-        planning_horizon=1,
+        planning_horizon=2,
         zmin=ZMIN,
         zmax=ZMAX,
     )
     end_time = time.time()
-    target_x, target_y, target_z = control_waypoints[0]
+    current_pose = np.array([cx, cy, cz], dtype=float)
+    reachable_now_tolerance = step
+    target_x, target_y, target_z = control_waypoints[-1]
+    for candidate in control_waypoints:
+        candidate_pose = np.asarray(candidate, dtype=float)
+        if np.linalg.norm(candidate_pose - current_pose) > reachable_now_tolerance:
+            target_x, target_y, target_z = candidate
+            break
 
     print("Replanning...")
     print(f"Replanning time: {end_time - start_time:.4f} seconds")
@@ -128,11 +189,16 @@ def replan_target(cx, cy, cz, mu, P, xs, ys):
 
 
 if __name__ == "__main__":
-    csv_path = r"C:\Users\Aksha\OneDrive\Year 6\Thesis\scripts\csv"
-    output_dir = Path(__file__).resolve().parent / "Vizualization" / f"greedygradient_map_{selected_map}_viz"
+    csv_path = Path(os.environ.get("CSV_DIR", str(SCRIPT_DIR / "csv")))
+    output_name = f"greedygradient_map_{MAPTYPE}_{selected_map}_viz"
+    run_output_tag = os.environ.get("RUN_OUTPUT_TAG")
+    if run_output_tag:
+        output_name = f"{output_name}_{run_output_tag}"
+    results_root = Path(os.environ.get("RESULTS_ROOT", str(SCRIPT_DIR / "Vizualization")))
+    output_dir = results_root / output_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    data = np.loadtxt(rf"{csv_path}/map_{selected_map}_{MAPTYPE}_grid_counts.csv", delimiter=",", skiprows=1)
+    data = np.loadtxt(csv_path / f"map_{selected_map}_{MAPTYPE}_grid_counts.csv", delimiter=",", skiprows=1)
     gp, X_test, mean, cov, xs, ys, X, Y, xmin, xmax, ymin, ymax, step = initialize_gp()
 
     pts = data[:, 0:3]
@@ -155,8 +221,8 @@ if __name__ == "__main__":
 
     rng = np.random.default_rng(SENSORNOISE_SEED + selected_map)
 
-    # mean = np.full(X_test.shape[0], utility_threshold - 0.1)
-    mean = np.full(X_test.shape[0], utility_threshold + 0.1)
+    mean = np.full(X_test.shape[0], utility_threshold + 0.1) #UCB variant (grf)
+    # mean = np.full(X_test.shape[0], utility_threshold - 0.1) #pessimistic prior for LCB/NAIP: everywhere starts important
     mu = mean.copy()
     P = cov.copy()
 
@@ -171,12 +237,15 @@ if __name__ == "__main__":
     control_waypoint_history = []
     pose_history = []
 
-    mu_history.append(mu.copy())
-    P_history.append(P.copy())
+    collect_viz_history = os.environ.get("SKIP_VIZ", "0") != "1"
+    if collect_viz_history:
+        mu_history.append(mu.copy())
+        P_history.append(P.copy())
     step_numbers.append(0)
 
     initial_utility = importance_filter(mu, P, beta, threshold=utility_threshold)
-    utility_history.append(initial_utility.copy())
+    if collect_viz_history:
+        utility_history.append(initial_utility.copy())
     planned_path_history.append([])
     control_waypoint_history.append([])
 
@@ -184,18 +253,20 @@ if __name__ == "__main__":
     lateral_coverage = step * 2
     samplestep = step
 
-    cx, cy, cz = 50.0, 50.0, INIT_ALTITUDE
+    cx, cy, cz = 4.0, 4.0, INIT_ALTITUDE
     grad_x, grad_y, grad_z = 0.0, 0.0, 0.0
     target_x, target_y, target_z = cx, cy, cz
     pos_history.append((cx, cy))
     pose_history.append((cx, cy, cz))
 
     initial_var_field = np.diag(P).reshape(X.shape)
-    gy0, gx0 = np.gradient(initial_var_field, Y[:, 0], X[0, :])
-    grad_history.append((gx0, gy0))
-    sorted_util_values_list.append(grid_measure(initial_utility, xs, ys))
+    if collect_viz_history:
+        gy0, gx0 = np.gradient(initial_var_field, Y[:, 0], X[0, :])
+        grad_history.append((gx0, gy0))
+        sorted_util_values_list.append(grid_measure(initial_utility, xs, ys))
 
     initial_total_variance = np.sum(np.diag(P))
+    variance_history = [initial_total_variance]
     print(f"Map {selected_map}: Initial total variance: {initial_total_variance:.4f}")
 
     utility = initial_utility
@@ -245,8 +316,24 @@ if __name__ == "__main__":
                 )
 
             prev_cx, prev_cy = cx, cy
-            cx, cy, cz = dynamics_3d(
-                cx, cy, cz, grad_x, grad_y, grad_z, samplestep, xmin, xmax, ymin, ymax, ZMIN, ZMAX, buffer=step / 2
+            cx, cy, cz = dynamics_3d_with_progress(
+                cx,
+                cy,
+                cz,
+                grad_x,
+                grad_y,
+                grad_z,
+                target_x,
+                target_y,
+                target_z,
+                samplestep,
+                xmin,
+                xmax,
+                ymin,
+                ymax,
+                ZMIN,
+                ZMAX,
+                buffer=step / 2,
             )
             pos_history.append((cx, cy))
             pose_history.append((cx, cy, cz))
@@ -268,15 +355,17 @@ if __name__ == "__main__":
             mu, P, sensor, z_meas, R_cov, block_ids=sensor_block_ids
         )
         utility = importance_filter(mu, P, beta, threshold=utility_threshold)
+        variance_history.append(float(np.sum(np.diag(P))))
 
-        mu_history.append(mu.copy())
-        P_history.append(P.copy())
-        utility_history.append(utility.copy())
-        sorted_util_values_list.append(grid_measure(utility, xs, ys))
+        if collect_viz_history:
+            mu_history.append(mu.copy())
+            P_history.append(P.copy())
+            utility_history.append(utility.copy())
+            sorted_util_values_list.append(grid_measure(utility, xs, ys))
 
-        var_field = np.diag(P).reshape(X.shape)
-        gy, gx = np.gradient(var_field, Y[:, 0], X[0, :])
-        grad_history.append((gx, gy))
+            var_field = np.diag(P).reshape(X.shape)
+            gy, gx = np.gradient(var_field, Y[:, 0], X[0, :])
+            grad_history.append((gx, gy))
 
         util = utility.reshape(len(ys), len(xs))
 
@@ -308,7 +397,7 @@ if __name__ == "__main__":
 
     timestep_index = np.asarray(step_numbers[1:], dtype=int)
     wall_time_arr = np.asarray(wall_time_history, dtype=float)
-    variancelist = [np.sum(np.diag(P)) for P in P_history]
+    variancelist = variance_history
     variance_per_step = np.asarray(variancelist[1:], dtype=float)
 
     metrics_trace = np.column_stack(
@@ -319,6 +408,20 @@ if __name__ == "__main__":
         metrics_trace,
         delimiter=",",
         header="timestep,wall_time_seconds,global_rmse,occupied_rmse,global_variance",
+        comments="",
+    )
+    pose_trace = np.column_stack(
+        [
+            np.asarray(step_numbers, dtype=int),
+            np.concatenate(([0.0], wall_time_arr)),
+            np.asarray(pose_history, dtype=float),
+        ]
+    )
+    np.savetxt(
+        output_dir / f"map_{selected_map}_executed_trajectory.csv",
+        pose_trace,
+        delimiter=",",
+        header="timestep,wall_time_seconds,x,y,z",
         comments="",
     )
 

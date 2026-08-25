@@ -8,8 +8,8 @@ from tqdm import tqdm
 step = 2
 map_range = 40
 #ground truth data subsampling
-csv_path = r"C:\Users\Aksha\OneDrive\Year 6\Thesis\Datasets\NAIP_dataset\selected_tiles_csv"
-# csv_path = r"C:\Users\Aksha\OneDrive\Year 6\Thesis\scripts\csv"
+# csv_path = r"C:\Users\Aksha\OneDrive\Year 6\Thesis\Datasets\NAIP_dataset\selected_tiles_csv"
+csv_path = r"C:\Users\Aksha\OneDrive\Year 6\Thesis\scripts\csv"
 
 
 length_scales = []
@@ -20,8 +20,8 @@ nus = []
 
 
 for map_id in tqdm(range(1, map_range), desc="Processing maps"):
-    csv_file = rf"{csv_path}\map_{map_id}_NAIP_grid_counts.csv"
-    # csv_file = rf"{csv_path}\map_{map_id}_multiblob_normalized_grid_counts.csv"
+    # csv_file = rf"{csv_path}\map_{map_id}_NAIP_grid_counts.csv"
+    csv_file = rf"{csv_path}\map_{map_id}_multiblob_normalized_grid_counts.csv"
     df = pd.read_csv(csv_file)
     df_sub = df[(df["x"] % step == 0 ) & (df["y"] % step == 0 )].copy()
 

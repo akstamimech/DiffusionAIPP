@@ -130,7 +130,7 @@ posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod
 DATASET_PATH = Path(
     os.environ.get(
         "DIFFUSION_DATASET_PATH",
-        str(SCRIPT_DIR.parent / "CMAES_beamsearch_dataset_3d_synthetic_final.pt"),
+        str(SCRIPT_DIR.parent / "dataset_grf_60.pt"),
     )
 )
 data_dict = torch.load(

@@ -42,7 +42,6 @@ Input conditioning:
 - current variance map
 - current-position marker map (XY only)
 - current position coordinates (XYZ)
-- initial heading velocity (XYZ)
 - log total GP variance scalar
 
 Target:
@@ -225,18 +224,6 @@ else:
         f"got {tuple(control_waypoints.shape)}"
     )
 
-if "initial_heading_velocity" in data_dict:
-    raw_initial_heading_velocity = data_dict["initial_heading_velocity"].float()
-else:
-    raw_initial_heading_velocity = trajectories[:, :, 1] - trajectories[:, :, 0]
-
-if raw_initial_heading_velocity.shape != raw_current_positions.shape:
-    raise ValueError(
-        "Expected initial_heading_velocity shape to match current_position "
-        f"{tuple(raw_current_positions.shape)}, got {tuple(raw_initial_heading_velocity.shape)}"
-    )
-
-initial_heading_velocities = normalize_xyz_displacement(raw_initial_heading_velocity)
 trajectories = normalize_xyz(trajectories)
 
 def denormalize_control_waypoints(waypoints):
@@ -439,7 +426,6 @@ meanvarmarkermaps = torch.stack([means, vars, one_hot_current_positions.squeeze(
 if INDEX is not None and INDEX > 0:
     trajectories = trajectories[:INDEX]
     conditions = conditions[:INDEX]
-    initial_heading_velocities = initial_heading_velocities[:INDEX]
     total_variance_conditions = total_variance_conditions[:INDEX]
     means = means[:INDEX]
     vars = vars[:INDEX]
@@ -457,7 +443,6 @@ class TrajectoryDataset(Dataset):
         weights,
         meanvarmarkermaps=meanvarmarkermaps,
         conditions=None,
-        initial_heading_velocities=None,
         total_variance_conditions=None,
     ):
         self.trajectories = trajectories
@@ -465,7 +450,6 @@ class TrajectoryDataset(Dataset):
         self.rmsedrop = rmsedrop
         self.conditions = conditions
         self.meanvarmarkermaps = meanvarmarkermaps
-        self.initial_heading_velocities = initial_heading_velocities
         self.total_variance_conditions = total_variance_conditions
 
     def __len__(self):
@@ -474,10 +458,6 @@ class TrajectoryDataset(Dataset):
     def __getitem__(self, idx):
         if self.conditions is None:
             return self.trajectories[idx]
-        if self.initial_heading_velocities is None:
-            initial_heading_velocity = torch.zeros_like(self.conditions[idx])
-        else:
-            initial_heading_velocity = self.initial_heading_velocities[idx]
         if self.total_variance_conditions is None:
             total_variance_condition = torch.zeros(
                 1,
@@ -490,7 +470,6 @@ class TrajectoryDataset(Dataset):
             self.trajectories[idx],
             self.conditions[idx],
             self.meanvarmarkermaps[idx],
-            initial_heading_velocity,
             total_variance_condition,
             self.weights[idx],
         )
@@ -697,7 +676,6 @@ class WPTokenization(nn.Module):
         self.waypoint_pos_emb = SequenceSinusoidalPositionEmbeddings(token_dim)
         self.final_norm = nn.LayerNorm(token_dim)
         self.current_pos_mlp = nn.Sequential(nn.Linear(NUM_COORDS, token_dim), nn.SiLU(), nn.Linear(token_dim, token_dim))
-        self.heading_mlp = nn.Sequential(nn.Linear(NUM_COORDS, token_dim), nn.SiLU(), nn.Linear(token_dim, token_dim))
         self.total_variance_mlp = nn.Sequential(nn.Linear(1, token_dim), nn.SiLU(), nn.Linear(token_dim, token_dim))
         nn.init.zeros_(self.total_variance_mlp[-1].weight)
         nn.init.zeros_(self.total_variance_mlp[-1].bias)
@@ -705,7 +683,6 @@ class WPTokenization(nn.Module):
     def forward(
         self,
         current_position,
-        initial_heading_velocity=None,
         total_variance_condition=None,
     ):
         """
@@ -721,15 +698,6 @@ class WPTokenization(nn.Module):
 
         current_pos_tokens = self.current_pos_mlp(current_position) # [B, token_dim]
         current_pos_tokens = current_pos_tokens.unsqueeze(1) # [B, 1, token_dim]
-
-        if initial_heading_velocity is None:
-            initial_heading_velocity = torch.zeros_like(current_position)
-        initial_heading_velocity = initial_heading_velocity.to(
-            device=current_position.device,
-            dtype=current_position.dtype,
-        )
-        heading_tokens = self.heading_mlp(initial_heading_velocity) # [B, token_dim]
-        heading_tokens = heading_tokens.unsqueeze(1) # [B, 1, token_dim]
 
         if total_variance_condition is None:
             total_variance_condition = torch.zeros(
@@ -748,7 +716,6 @@ class WPTokenization(nn.Module):
         total_variance_tokens = total_variance_tokens.unsqueeze(1) # [B, 1, token_dim]
 
         waypoint_tokens = waypoint_tokens + current_pos_tokens # add current position embedding to each waypoint token
-        waypoint_tokens = waypoint_tokens + heading_tokens # add initial heading velocity embedding to each waypoint token
         waypoint_tokens = waypoint_tokens + total_variance_tokens # add total GP uncertainty embedding to each waypoint token
 
         waypoint_tokens = self.final_norm(waypoint_tokens) # normalize across token_dim for each token
@@ -906,13 +873,11 @@ class WaypointPredictor(nn.Module):
         self,
         meanvarmarker_map,
         current_position=None,
-        initial_heading_velocity=None,
         total_variance_condition=None,
     ):
         map_tokens = self.mean_var_marker_cnn(meanvarmarker_map) # [B, 144, token_dim]
         wp_tokens = self.wp_tokenization(
             current_position,
-            initial_heading_velocity,
             total_variance_condition,
         ) # [B, 8, token_dim]
         for attention_block in self.attention_blocks:
@@ -966,7 +931,6 @@ def get_loss(
     WP_true,
     meanvarmarker_map,
     current_position,
-    initial_heading_velocity=None,
     total_variance_condition=None,
     weights=None,
     alpha=0.0,
@@ -979,7 +943,6 @@ def get_loss(
         WP_pred = model(
             meanvarmarker_map,
             current_position,
-            initial_heading_velocity,
             total_variance_condition,
         )
     WP_pred = WP_pred.float()
@@ -999,13 +962,11 @@ def sample_plot_traj(output_path=None):
     model.eval()
     meanvarmarker_map = meanvarmarkermaps[0:1].to(next(model.parameters()).device)
     current_position = conditions[0:1].to(next(model.parameters()).device)
-    initial_heading_velocity = initial_heading_velocities[0:1].to(next(model.parameters()).device)
     total_variance_condition = total_variance_conditions[0:1].to(next(model.parameters()).device)
 
     traj = model(
         meanvarmarker_map,
         current_position,
-        initial_heading_velocity,
         total_variance_condition,
     )
 
@@ -1091,14 +1052,12 @@ def train_one_sample(model, steps=3000, batch_size=64):
 
     x0 = trajectories[:1].to(device)
     pos0 = conditions[:1].to(device)
-    heading0 = initial_heading_velocities[:1].to(device)
     total_variance0 = total_variance_conditions[:1].to(device)
     meanvarmarker_map = meanvarmarkermaps[:1].to(device)
 
     for step in range(steps):
         traj = x0.repeat(batch_size, 1, 1)
         current_position = pos0.repeat(batch_size, 1)
-        initial_heading_velocity = heading0.repeat(batch_size, 1)
         total_variance_condition = total_variance0.repeat(batch_size, 1)
         batch_meanvarmarker_map = meanvarmarker_map.repeat(batch_size, 1, 1, 1)
 
@@ -1107,7 +1066,6 @@ def train_one_sample(model, steps=3000, batch_size=64):
             traj,
             batch_meanvarmarker_map,
             current_position,
-            initial_heading_velocity,
             total_variance_condition,
         )
         losses.append(loss.item())
@@ -1146,27 +1104,20 @@ def evaluate(model, dataloader):
     model_device = next(model.parameters()).device
 
     for batch in dataloader:
-        if len(batch) == 6:
+        if len(batch) == 5:
             (
                 traj,
                 current_position,
                 meanvarmarker_map,
-                initial_heading_velocity,
                 total_variance_condition,
                 batch_weights,
             ) = batch
-        elif len(batch) == 5:
-            traj, current_position, meanvarmarker_map, initial_heading_velocity, batch_weights = batch
-            total_variance_condition = None
         else:
             traj, current_position, meanvarmarker_map, batch_weights = batch
-            initial_heading_velocity = None
             total_variance_condition = None
         traj = traj.to(model_device, non_blocking=True)
         current_position = current_position.to(model_device, non_blocking=True)
         meanvarmarker_map = meanvarmarker_map.to(model_device, non_blocking=True)
-        if initial_heading_velocity is not None:
-            initial_heading_velocity = initial_heading_velocity.to(model_device, non_blocking=True)
         if total_variance_condition is not None:
             total_variance_condition = total_variance_condition.to(model_device, non_blocking=True)
         loss = get_loss(
@@ -1174,7 +1125,6 @@ def evaluate(model, dataloader):
             traj,
             meanvarmarker_map,
             current_position,
-            initial_heading_velocity,
             total_variance_condition,
         )
         batch_size = traj.shape[0]
@@ -1213,28 +1163,21 @@ def train(
         epoch_sample_count = 0
         for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
             stepcount.append(epoch * len(dataloader) + step)
-            if len(batch) == 6:
+            if len(batch) == 5:
                 (
                     traj,
                     current_position,
                     meanvarmarker_map,
-                    initial_heading_velocity,
                     total_variance_condition,
                     batch_weights,
                 ) = batch
-            elif len(batch) == 5:
-                traj, current_position, meanvarmarker_map, initial_heading_velocity, batch_weights = batch
-                total_variance_condition = None
             else:
                 traj, current_position, meanvarmarker_map, batch_weights = batch
-                initial_heading_velocity = None
                 total_variance_condition = None
             model_device = next(model.parameters()).device
             traj = traj.to(model_device, non_blocking=True)
             current_position = current_position.to(model_device, non_blocking=True)
             meanvarmarker_map = meanvarmarker_map.to(model_device, non_blocking=True)
-            if initial_heading_velocity is not None:
-                initial_heading_velocity = initial_heading_velocity.to(model_device, non_blocking=True)
             if total_variance_condition is not None:
                 total_variance_condition = total_variance_condition.to(model_device, non_blocking=True)
             loss = get_loss(
@@ -1242,7 +1185,6 @@ def train(
                 traj,
                 meanvarmarker_map,
                 current_position,
-                initial_heading_velocity,
                 total_variance_condition,
             )
             loss_vals.append(loss.item())
@@ -1376,7 +1318,6 @@ if __name__ == "__main__":
         weights[train_mask],
         meanvarmarkermaps=meanvarmarkermaps[train_mask],
         conditions=conditions[train_mask],
-        initial_heading_velocities=initial_heading_velocities[train_mask],
         total_variance_conditions=total_variance_conditions[train_mask],
     )
     val_dataset = TrajectoryDataset(
@@ -1384,7 +1325,6 @@ if __name__ == "__main__":
         weights[val_mask],
         meanvarmarkermaps=meanvarmarkermaps[val_mask],
         conditions=conditions[val_mask],
-        initial_heading_velocities=initial_heading_velocities[val_mask],
         total_variance_conditions=total_variance_conditions[val_mask],
     )
     val_dataloader_kwargs = dict(dataloader_kwargs)

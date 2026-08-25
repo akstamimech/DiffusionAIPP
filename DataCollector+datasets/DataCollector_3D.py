@@ -9,7 +9,7 @@ import torch
 matplotlib.use("Agg")
 
 script_dir = Path(__file__).resolve().parent
-project_root = script_dir.parent
+project_root = script_dir
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
@@ -42,8 +42,8 @@ beta_values = (1.0, 1.0, 1.0, 1.0, 1.0)
 alpha = 0.02
 utility_threshold = 0.3
 planning_horizon = 8
-initial_map = 1
-mapcount = 30
+initial_map = 31
+mapcount = 20
 samples_per_segment = 5
 execution_chunk = 20
 SENSORNOISE_SEED = 123
@@ -275,7 +275,7 @@ def real_receding_horizon_planner(
     beta,
     planning_horizon,
     alpha=0.1,
-    seed = cma_seed
+    planner_seed=None,
 ):
     flight_plan_3d = grid_search_3d(
         mu,
@@ -306,7 +306,7 @@ def real_receding_horizon_planner(
         ZMIN,
         ZMAX,
         predictive_variance=True,
-        seed = cma_seed
+        seed=planner_seed,
     )
 
 
@@ -376,7 +376,7 @@ def simulate_candidate(
     ymax,
     samplestep,
     rng_seed,
-    cma_seeded
+    planner_seed,
 ):
     sim_cx, sim_cy, sim_cz = cx, cy, cz
     sim_mu = mu.copy()
@@ -395,7 +395,7 @@ def simulate_candidate(
         beta,
         planning_horizon,
         alpha=alpha,
-        seed = cma_seeded
+        planner_seed=planner_seed,
     )
     spline_path = build_spline_trajectory_3d(
         sim_cx,
@@ -662,7 +662,7 @@ def main():
                     ymax,
                     samplestep,
                     rng_seed=candidate_seed,
-                    cma_seeded = 
+                    planner_seed=candidate_seed + 10000,
                 )
                 candidate["beam_score"] = state["beam_score"] + candidate["global_rmse"]
                 candidate["baseline_rmse"] = beam_contexts[beam_index]["baseline_rmse"]

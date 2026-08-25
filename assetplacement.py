@@ -7,10 +7,10 @@ import csv
 
 number_of_maps = 200
 fulllist = []
-number_of_focii = 20
+max_number_of_focii = 20
 plantradius = 1
 intensity = 200
-how_concentrated = 7
+how_concentrated = 5
 
 path = r"C:\Users\Aksha\OneDrive\Year 6\Thesis\scripts\csv"
 
@@ -94,8 +94,8 @@ for map in range(number_of_maps + 1):
         #       that the planner would always resolve first, and
         #   (b) a minimum spacing between blob centres -> distinct, separated targets rather than
         #       one merged region, so "which target next" stays a real choice at every step.
-        number_of_blobs = np.random.randint(3, 6)  # 3-5 distinct targets
-        min_separation = 25.0                      # keep centres this far apart (map units)
+        number_of_blobs = np.random.randint(8, max_number_of_focii)  # 8-20 distinct targets
+        min_separation = 12.0                     # keep centres this far apart (map units)
         gaussian_centers = []
         attempts = 0
         while len(gaussian_centers) < number_of_blobs and attempts < 1000:
