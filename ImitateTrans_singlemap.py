@@ -26,22 +26,28 @@ from CMAES_classic_singlemap import compute_fov, dynamics_3d, waypoint_3d
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
+# ImitateTrans derives every inference normalization statistic from this
+# dataset at import time.  Use the GRF training distribution by default while
+# retaining IMITATE_DATASET_PATH as an explicit override.
+GRF_DATASET_PATH = SCRIPT_DIR / "dataset_grf_60.pt"
+os.environ.setdefault("IMITATE_DATASET_PATH", str(GRF_DATASET_PATH))
+
 import ImitateTrans as imitate_trans
 
 step = 2.0
-timealloted = 300
+timealloted = int(os.environ.get("TIMEALLOTED", "3000"))
 beta = 1.0
 alpha = 0.02
-utility_threshold = 0.3
-planning_horizon = 8
-selected_map = int(os.environ.get("SELECTED_MAP", 39))
+utility_threshold = float(os.environ.get("UTILITY_THRESHOLD", "0.5"))
+planning_horizon = int(os.environ.get("PLANNING_HORIZON", "8"))
+selected_map = int(os.environ.get("SELECTED_MAP", 55))
 samples_per_segment = 5
-execution_chunk = int(os.environ.get("EXECUTION_CHUNK", 20))
-SENSORNOISE_SEED = 123
-MAPTYPE = os.environ.get("MAPTYPE", "NAIP")
+execution_chunk = int(os.environ.get("EXECUTION_CHUNK", 5))
+SENSORNOISE_SEED = int(os.environ.get("SENSORNOISE_SEED", "123"))
+MAPTYPE = os.environ.get("MAPTYPE", "grf")
 CHUNK_SIZE = 256
 CHUNK_PREFIX = "./trajectory_dataset_chunk"
-WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "300"))  # <=0 = unconstrained (timestep
+WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "150"))  # <=0 = unconstrained (timestep
                                                                       # loop runs to completion); otherwise
                                                                       # the flight ends at timealloted
                                                                       # timesteps OR this many real
@@ -64,13 +70,15 @@ MIN_STEP_SECONDS = STEP_DISTANCE_METERS / FLIGHT_SPEED_MPS
 imitate_checkpoint_path = Path(
     os.environ.get(
         "IMITATE_CHECKPOINT",
-        str(SCRIPT_DIR / "checkpoints" / "imitate_trans_waypoints_epoch_750_unimodaltest.pth"),
+        str(SCRIPT_DIR / "checkpoints" / "Imitate_best.pth"),
     )
 )
 INIT_ALTITUDE = 10.0
 ZMIN = imitate_trans.Z_MIN
 ZMAX = imitate_trans.Z_MAX
 ANGLE_OF_VIEW = 60.0
+START_X = float(os.environ.get("START_X", "4.0"))
+START_Y = float(os.environ.get("START_Y", "4.0"))
 
 """
 Single-map verification copy of receding_gridsearch_diffusion.py, using the direct
@@ -89,7 +97,7 @@ def load_imitate_model(checkpoint_path=None):
         )
         state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
         state_dict = imitate_trans.remap_legacy_state_dict_keys(state_dict)
-        model.load_state_dict(state_dict)
+        imitate_trans.load_model_state_dict_compatible(model, state_dict)
     model.eval()
     imitate_trans.model = model
     return model
@@ -117,6 +125,9 @@ def sample_imitation_trajectory(
     current_var = torch.tensor(current_var, dtype=torch.float32, device=imitate_trans.device)
 
     mean_map = (current_mean - imitate_trans.mean_center.to(imitate_trans.device)) / imitate_trans.mean_scale.to(imitate_trans.device)
+    total_variance_condition = imitate_trans.normalize_total_variance(
+        current_var.reshape(1, -1).sum(dim=1, keepdim=True)
+    ).to(imitate_trans.device)
     var_map = (current_var - imitate_trans.var_center.to(imitate_trans.device)) / imitate_trans.var_scale.to(imitate_trans.device)
     marker_map = imitate_trans.make_position_marker_maps(
         current_position_world[:, :2].cpu(),
@@ -145,6 +156,7 @@ def sample_imitation_trajectory(
         meanvarmarker_map,
         current_position_model,
         initial_heading_velocity,
+        total_variance_condition,
     )
 
     control_waypoints = imitate_trans.extract_control_waypoints(normalized_waypoints[0])
@@ -289,14 +301,19 @@ def finalize_chunks(num_chunks, final_path="./trajectory_dataset.pt"):
 
 
 if __name__ == "__main__":
-    csv_path = r"C:\Users\Aksha\OneDrive\Year 6\Thesis\scripts\csv"
-    output_dir = Path(__file__).resolve().parent / "Vizualization" / f"imitate_trans_map_{MAPTYPE}_{selected_map}_viz"
+    csv_path = Path(os.environ.get("CSV_DIR", str(SCRIPT_DIR / "csv")))
+    output_name = f"imitate_trans_map_{MAPTYPE}_{selected_map}_viz"
+    run_output_tag = os.environ.get("RUN_OUTPUT_TAG")
+    if run_output_tag:
+        output_name = f"{output_name}_{run_output_tag}"
+    results_root = Path(os.environ.get("RESULTS_ROOT", str(SCRIPT_DIR / "Vizualization")))
+    output_dir = results_root / output_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
     imitate_model = load_imitate_model(checkpoint_path=imitate_checkpoint_path)
 
     data = np.loadtxt(
-        rf"{csv_path}/map_{selected_map}_{MAPTYPE}_grid_counts.csv",
+        csv_path / f"map_{selected_map}_{MAPTYPE}_grid_counts.csv",
         delimiter=",",
         skiprows=1,
     )
@@ -316,7 +333,8 @@ if __name__ == "__main__":
 
     rng = np.random.default_rng(SENSORNOISE_SEED + selected_map)
 
-    mean = np.full(X_test.shape[0], utility_threshold - 0.1)
+    # Under GRF/UCB, the optimistic prior starts above the importance threshold.
+    mean = np.full(X_test.shape[0], utility_threshold + 0.1)
     mu = mean.copy()
     P = cov.copy()
 
@@ -332,20 +350,23 @@ if __name__ == "__main__":
     pose_history = []
     altitude_history = []
 
-    mu_history.append(mu.copy())
-    P_history.append(P.copy())
+    collect_viz_history = os.environ.get("SKIP_VIZ", "0") != "1"
+    if collect_viz_history:
+        mu_history.append(mu.copy())
+        P_history.append(P.copy())
     step_numbers.append(0)
     planned_path_history.append([])
     control_waypoint_history.append([])
 
     initial_utility = importance_filter(mu, P, beta, threshold=utility_threshold)
-    utility_history.append(initial_utility.copy())
+    if collect_viz_history:
+        utility_history.append(initial_utility.copy())
 
     save_every = 5
     lateral_coverage = step * 2
     samplestep = step
 
-    cx, cy, cz = 4.0, 4.0, INIT_ALTITUDE
+    cx, cy, cz = START_X, START_Y, INIT_ALTITUDE
     grad_x, grad_y, grad_z = 0.0, 0.0, 0.0
     current_heading_velocity = np.zeros(3, dtype=np.float32)
     pos_history.append((cx, cy))
@@ -353,11 +374,13 @@ if __name__ == "__main__":
     altitude_history.append(cz)
 
     initial_var_field = np.diag(P).reshape(X.shape)
-    gy0, gx0 = np.gradient(initial_var_field, Y[:, 0], X[0, :])
-    grad_history.append((gx0, gy0))
-    sorted_util_values_list.append(grid_measure(initial_utility, xs, ys))
+    if collect_viz_history:
+        gy0, gx0 = np.gradient(initial_var_field, Y[:, 0], X[0, :])
+        grad_history.append((gx0, gy0))
+        sorted_util_values_list.append(grid_measure(initial_utility, xs, ys))
 
     initial_total_variance = np.sum(np.diag(P))
+    variance_history = [initial_total_variance]
     print(f"Map {selected_map}: Initial total variance: {initial_total_variance:.4f}")
 
     utility = initial_utility
@@ -541,14 +564,16 @@ if __name__ == "__main__":
             rng,
         )
         utility = importance_filter(mu, P, beta, threshold=utility_threshold)
-        mu_history.append(mu.copy())
-        P_history.append(P.copy())
-        utility_history.append(utility.copy())
-        sorted_util_values_list.append(grid_measure(utility, xs, ys))
+        variance_history.append(float(np.sum(np.diag(P))))
+        if collect_viz_history:
+            mu_history.append(mu.copy())
+            P_history.append(P.copy())
+            utility_history.append(utility.copy())
+            sorted_util_values_list.append(grid_measure(utility, xs, ys))
 
-        var_field = np.diag(P).reshape(X.shape)
-        gy, gx = np.gradient(var_field, Y[:, 0], X[0, :])
-        grad_history.append((gx, gy))
+            var_field = np.diag(P).reshape(X.shape)
+            gy, gx = np.gradient(var_field, Y[:, 0], X[0, :])
+            grad_history.append((gx, gy))
 
         util = utility.reshape(len(ys), len(xs))
 
@@ -580,7 +605,7 @@ if __name__ == "__main__":
 
     timestep_index = np.asarray(step_numbers[1:], dtype=int)
     wall_time_arr = np.asarray(wall_time_history, dtype=float)
-    variancelist = [np.sum(np.diag(P)) for P in P_history]
+    variancelist = variance_history
     variance_per_step = np.asarray(variancelist[1:], dtype=float)
 
     metrics_trace = np.column_stack(
@@ -591,6 +616,20 @@ if __name__ == "__main__":
         metrics_trace,
         delimiter=",",
         header="timestep,wall_time_seconds,global_rmse,occupied_rmse,global_variance",
+        comments="",
+    )
+    pose_trace = np.column_stack(
+        [
+            np.asarray(step_numbers, dtype=int),
+            np.concatenate(([0.0], wall_time_arr)),
+            np.asarray(pose_history, dtype=float),
+        ]
+    )
+    np.savetxt(
+        output_dir / f"map_{selected_map}_executed_trajectory.csv",
+        pose_trace,
+        delimiter=",",
+        header="timestep,wall_time_seconds,x,y,z",
         comments="",
     )
 

@@ -29,10 +29,10 @@ timealloted = 150
 MAP_ID_START = 20
 MAP_ID_END = 25
 RUNS_PER_MAP = 1
-MAPTYPE = "NAIP"
+MAPTYPE = "grf"
 SENSORNOISE_SEED = 123
 output_root = SCRIPT_DIR / "lawnmower_batch_metrics"
-utility_threshold = 0.3
+utility_threshold = 0.5
 INIT_ALTITUDE = 10.0
 
 

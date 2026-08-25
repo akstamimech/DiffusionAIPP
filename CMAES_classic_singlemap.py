@@ -9,7 +9,7 @@ from pathlib import Path
 import imageio.v2 as imageio
 from matplotlib.patches import Rectangle
 from gaussianprocesstraining import noise_model, utility_function, sampler, create_plots_and_gifs, kalman_update, initialize_gp, grid_search
-from gaussianprocesstraining import importance_filter, grid_measure, next_best_waypoint, cma_es_refine_waypoints_3d, build_spline_trajectory_3d, fov_lateral_radius, resolution_block_size, grid_search_3d, grid_search_3d_softmax
+from gaussianprocesstraining import importance_filter, grid_measure, next_best_waypoint, cma_es_refine_waypoints_3d, build_spline_trajectory_3d, fov_lateral_radius, resolution_block_size, grid_search_3d, grid_search_3d_softmax, clip_waypoints_continuous_3d
 from gaussianprocesstraining import (
     build_correlated_noise_covariance,
     build_sensor_matrix,
@@ -20,21 +20,27 @@ from evalmetrics import compute_task_completion, compute_reconstruction_rmse, co
 import torch
 import time
 
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 step = 2.0
-timealloted = 300
-beta = 1
+timealloted = int(os.environ.get("TIMEALLOTED", "300"))
+beta = float(os.environ.get("BETA", "1"))
 alpha = 0.02
-utility_threshold = 0.4
-planning_horizon = 8
+utility_threshold = float(os.environ.get("UTILITY_THRESHOLD", "0.5"))
+planning_horizon = int(os.environ.get("PLANNING_HORIZON", "8"))
 #multiblob map 20 is nice!
-selected_map = int(os.environ.get("SELECTED_MAP", 22))
+selected_map = int(os.environ.get("SELECTED_MAP", 11))
 samples_per_segment = 5
-execution_chunk = 10
-SENSORNOISE_SEED = 123
+execution_chunk = int(os.environ.get("EXECUTION_CHUNK", "40"))
+SENSORNOISE_SEED = int(os.environ.get("SENSORNOISE_SEED", "123"))
 
-MAPTYPE = os.environ.get("MAPTYPE", "multiblob") #choose between "multiblob" and "halffield" or "blob" or "(nothing)" or "NAIP"
-cma_seed = 55
+MAPTYPE = os.environ.get("MAPTYPE", "halffield")
+cma_seed = int(os.environ.get("CMA_SEED", "55"))
+CMAES_REFINE = os.environ.get("CMAES_REFINE", "1") != "0"  # False -> skip the CMA-ES
+                                 # refinement step entirely and execute the grid
+                                 # search's raw waypoints, for an isolated
+                                 # lattice-only baseline (Popovic et al. 2020's own
+                                 # "Lattice" row in their Table 1 comparison).
 USE_SOFTMAX_GRID_SEARCH = False  # False -> original deterministic grid_search_3d (argmax
                                  # every step, same warm start every replan). True ->
                                  # grid_search_3d_softmax, which samples the warm start
@@ -42,7 +48,7 @@ USE_SOFTMAX_GRID_SEARCH = False  # False -> original deterministic grid_search_3
                                  # trajectories. Tune temperature/seed in
                                  # gaussianprocesstraining.GRID_SEARCH_SOFTMAX_TEMPERATURE
                                  # / GRID_SEARCH_SOFTMAX_SEED.
-WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "240"))  # <=0 = unconstrained (timestep
+WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "150"))  # <=0 = unconstrained (timestep
                                                                       # loop runs to completion); otherwise
                                                                       # the flight ends at timealloted
                                                                       # timesteps OR this many real
@@ -55,7 +61,7 @@ WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "240"))  # <=0 = u
 # than that gets padded with a sleep up to the floor; a step that already took
 # longer (e.g. one that triggered a replan) is left alone - this is a floor,
 # not a fixed duration.
-ENFORCE_MIN_STEP_TIME = os.environ.get("ENFORCE_MIN_STEP_TIME", "0") == "1"
+ENFORCE_MIN_STEP_TIME = os.environ.get("ENFORCE_MIN_STEP_TIME", "1") == "1"
 STEP_DISTANCE_METERS = 1.0
 FLIGHT_SPEED_MPS = 3.0
 MIN_STEP_SECONDS = STEP_DISTANCE_METERS / FLIGHT_SPEED_MPS
@@ -66,6 +72,8 @@ MIN_STEP_SECONDS = STEP_DISTANCE_METERS / FLIGHT_SPEED_MPS
 INIT_ALTITUDE = 10.0  # Example fixed altitude for all waypoints
 ZMIN = 10.0
 ZMAX = 40.0
+START_X = float(os.environ.get("START_X", "4.0"))
+START_Y = float(os.environ.get("START_Y", "4.0"))
 
 
 #TOTAL PLANNED = PLANNING HORIZON * SPLINE SAMPLES PER SEGMENT
@@ -121,6 +129,16 @@ def real_receding_horizon_planner(
         zmax=ZMAX,
         alpha=alpha,
     )
+
+    if not CMAES_REFINE:
+        return clip_waypoints_continuous_3d(
+            flight_plan_3d,
+            xs,
+            ys,
+            ZMIN,
+            ZMAX,
+            margin=step * 2,
+        )
 
     control_waypoints = cma_es_refine_waypoints_3d(
         flight_plan_3d,
@@ -244,11 +262,16 @@ def compute_fov(cz, xs, ys, angle_of_view = 60, step=step, cx=None, cy=None):
 
 
 if __name__ == "__main__":
-    csv_path = r"C:\Users\Aksha\OneDrive\Year 6\Thesis\scripts\csv"
-    output_dir = Path(__file__).resolve().parent / "Vizualization" / f"classic_map_{selected_map}_viz"
+    csv_path = Path(os.environ.get("CSV_DIR", str(SCRIPT_DIR / "csv")))
+    output_name = f"classic_map_{MAPTYPE}_{selected_map}_viz"
+    run_output_tag = os.environ.get("RUN_OUTPUT_TAG")
+    if run_output_tag:
+        output_name = f"{output_name}_{run_output_tag}"
+    results_root = Path(os.environ.get("RESULTS_ROOT", str(SCRIPT_DIR / "Vizualization")))
+    output_dir = results_root / output_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    data = np.loadtxt(rf"{csv_path}/map_{selected_map}_{MAPTYPE}_normalized_grid_counts.csv", delimiter=",", skiprows=1)
+    data = np.loadtxt(csv_path / f"map_{selected_map}_{MAPTYPE}_grid_counts.csv", delimiter=",", skiprows=1)
     gp, X_test, mean, cov, xs, ys, X, Y, xmin, xmax, ymin, ymax, step = initialize_gp()
 
     pts = data[:, 0:3]
@@ -271,9 +294,8 @@ if __name__ == "__main__":
 
     rng = np.random.default_rng(SENSORNOISE_SEED + selected_map)
 
-    # mu = mean.copy()
-    # mean = np.full(X_test.shape[0], utility_threshold - 0.1) ##ATTEMPT
-    mean = np.full(X_test.shape[0], utility_threshold + 0.1) ##ATTEMPT
+    # Under GRF/UCB, the optimistic prior starts above the importance threshold.
+    mean = np.full(X_test.shape[0], utility_threshold + 0.1)
     mu = mean.copy()
     P = cov.copy()
     R = noise_model(INIT_ALTITUDE)   # measurement noise variance based on altitude
@@ -289,12 +311,15 @@ if __name__ == "__main__":
     control_waypoint_history = []
     pose_history = []
 
-    mu_history.append(mu.copy())
-    P_history.append(P.copy())
+    collect_viz_history = os.environ.get("SKIP_VIZ", "0") != "1"
+    if collect_viz_history:
+        mu_history.append(mu.copy())
+        P_history.append(P.copy())
     step_numbers.append(0)
 
     initial_utility = importance_filter(mu, P, beta, threshold=utility_threshold)
-    utility_history.append(initial_utility.copy())
+    if collect_viz_history:
+        utility_history.append(initial_utility.copy())
     planned_path_history.append([])
     control_waypoint_history.append([])
 
@@ -302,18 +327,20 @@ if __name__ == "__main__":
     lateral_coverage = step * 2
     samplestep = step
 
-    cx, cy, cz = 4.0, 4.0, INIT_ALTITUDE
+    cx, cy, cz = START_X, START_Y, INIT_ALTITUDE
     grad_x, grad_y, grad_z = 0.0, 0.0, 0.0
     pos_history.append((cx, cy))
     pose_history.append((cx, cy, cz))
     fov = compute_fov(cz = cz, xs = xs, ys = ys, angle_of_view=60, step=step, cx=cx, cy=cy)
 
     initial_var_field = np.diag(P).reshape(X.shape)
-    gy0, gx0 = np.gradient(initial_var_field, Y[:, 0], X[0, :])
-    grad_history.append((gx0, gy0))
-    sorted_util_values_list.append(grid_measure(initial_utility, xs, ys))
+    if collect_viz_history:
+        gy0, gx0 = np.gradient(initial_var_field, Y[:, 0], X[0, :])
+        grad_history.append((gx0, gy0))
+        sorted_util_values_list.append(grid_measure(initial_utility, xs, ys))
 
     initial_total_variance = np.sum(np.diag(P))
+    variance_history = [initial_total_variance]
     print(f"Map {selected_map}: Initial total variance: {initial_total_variance:.4f}")
 
     utility = initial_utility
@@ -441,14 +468,16 @@ if __name__ == "__main__":
         )
         utility = importance_filter(mu, P, beta, threshold=utility_threshold)
 
-        mu_history.append(mu.copy())
-        P_history.append(P.copy())
-        utility_history.append(utility.copy())
-        sorted_util_values_list.append(grid_measure(utility, xs, ys))
+        variance_history.append(float(np.sum(np.diag(P))))
+        if collect_viz_history:
+            mu_history.append(mu.copy())
+            P_history.append(P.copy())
+            utility_history.append(utility.copy())
+            sorted_util_values_list.append(grid_measure(utility, xs, ys))
 
-        var_field = np.diag(P).reshape(X.shape)
-        gy, gx = np.gradient(var_field, Y[:, 0], X[0, :])
-        grad_history.append((gx, gy))
+            var_field = np.diag(P).reshape(X.shape)
+            gy, gx = np.gradient(var_field, Y[:, 0], X[0, :])
+            grad_history.append((gx, gy))
 
         util = utility.reshape(len(ys), len(xs))
         # print(util, "shape:", util.shape)
@@ -482,7 +511,7 @@ if __name__ == "__main__":
 
     timestep_index = np.asarray(step_numbers[1:], dtype=int)
     wall_time_arr = np.asarray(wall_time_history, dtype=float)
-    variancelist = [np.sum(np.diag(P)) for P in P_history]
+    variancelist = variance_history
     variance_per_step = np.asarray(variancelist[1:], dtype=float)
 
     metrics_trace = np.column_stack(
@@ -493,6 +522,20 @@ if __name__ == "__main__":
         metrics_trace,
         delimiter=",",
         header="timestep,wall_time_seconds,global_rmse,occupied_rmse,global_variance",
+        comments="",
+    )
+    pose_trace = np.column_stack(
+        [
+            np.asarray(step_numbers, dtype=int),
+            np.concatenate(([0.0], wall_time_arr)),
+            np.asarray(pose_history, dtype=float),
+        ]
+    )
+    np.savetxt(
+        output_dir / f"map_{selected_map}_executed_trajectory.csv",
+        pose_trace,
+        delimiter=",",
+        header="timestep,wall_time_seconds,x,y,z",
         comments="",
     )
 

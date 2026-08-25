@@ -17,7 +17,7 @@ CMA_SEED = 31
 # (effective evaluations ~= CMA_PREDICTIVE_MAXITER * CMA_PREDICTIVE_POPSIZE,
 # since maxiter binds before maxfevals at these defaults) without editing this
 # file per run.
-CMA_PREDICTIVE_MAXITER = int(os.environ.get("CMA_PREDICTIVE_MAXITER", "45"))
+CMA_PREDICTIVE_MAXITER = int(os.environ.get("CMA_PREDICTIVE_MAXITER", "25"))
 CMA_PREDICTIVE_MAXFEVALS = int(os.environ.get("CMA_PREDICTIVE_MAXFEVALS", "1000"))
 CMA_PREDICTIVE_POPSIZE = int(os.environ.get("CMA_PREDICTIVE_POPSIZE", "12"))
 
@@ -30,9 +30,13 @@ CMA_PREDICTIVE_POPSIZE = int(os.environ.get("CMA_PREDICTIVE_POPSIZE", "12"))
 # perform no better (often worse) than the lattice search it refines; these
 # smaller, per-axis values were swept against the lattice-only baseline on
 # real maps and consistently beat both the flat sigma0=4.0 default and, on
-# most maps/metrics, lattice search alone.
-CMA_STEP_SIZE_XY = 1.5
-CMA_STEP_SIZE_Z = 1.2
+# most maps/metrics, lattice search alone. NOTE: that sweep predates this
+# codebase's cost-normalization/boundary-penalty fixes to trajectory_objective_3d
+# (see its docstring/history), so it has not been re-validated under the fixed
+# objective - env-configurable so it can be swept again without editing this
+# file per run, the same treatment CMA_PREDICTIVE_MAXITER/BETA already got.
+CMA_STEP_SIZE_XY = float(os.environ.get("CMA_STEP_SIZE_XY", "20"))
+CMA_STEP_SIZE_Z = float(os.environ.get("CMA_STEP_SIZE_Z", "8"))
 
 # --- grid_search_3d softmax-selection hyperparameters ---
 # grid_search_3d_softmax replaces the per-step hard argmax over candidate
@@ -64,7 +68,18 @@ GRID_SEARCH_TIEBREAK_SEED = None  # None -> draws from numpy's global RNG state;
                                    # set an int for reproducible tie-breaking.
 
 
-LCB = False
+LCB = False  # GRF/UCB: cells are important when mu + beta*sigma reaches the threshold.
+
+COST_EXPONENT = float(os.environ.get("COST_EXPONENT", "1.0"))  # Exponent applied to the distance/cost denominator in the grid-search
+                      # step score (gain / distance**COST_EXPONENT, see _grid_search_3d_impl)
+                      # and the CMA-ES refinement objective (variance_reduction / cost**COST_EXPONENT,
+                      # see trajectory_objective_3d). 1.0 = original linear gain/cost ratio
+                      # (mirrors Popovic et al. 2020); lower values flatten the distance
+                      # penalty so a large gain far away competes more easily against a
+                      # smaller gain nearby, encouraging trajectories that travel to a
+                      # separate high-value cluster instead of exhausting the nearest one.
+                      # Values below 1.0 remain available as an explicit override for maps
+                      # with spatially separated high-value clusters.
 
 ###FOV FUNCTIONS 
 
@@ -347,8 +362,8 @@ def sampler(cx, cy, X, Y, P_history, samplestep):
 
 
 
-#importance_filter returns variance form for easy utility deduction!
-##LOWER CONFIDENCE BOUND!!
+# importance_filter returns variance form for easy utility deduction and uses
+# either the lower or upper confidence bound according to LCB.
 def importance_filter(mu, P, beta, threshold = 0.5, eps=1e-12):
 
 
@@ -452,9 +467,17 @@ def build_pyramid_lattice_3d(xs, ys, zmin, zmax, margin=None): ###changing hardc
     # points land on distinct cells - with thirds, the low and top layers'
     # snapped x/y values coincide, putting stacked same-xy candidates back
     # into the lattice despite the tapering footprint.
+    # Low tier count bumped 5->9 per axis: at z=zmin the FOV footprint side
+    # (~2*zmin*tan(30 deg)) is roughly half this tier's 5-point spacing,
+    # leaving real gaps between candidate footprints - the densest tier is
+    # the one place the coarse lattice was actually under-resolved relative
+    # to what the sensor can see. Middle/top tiers are left alone: their
+    # footprints already roughly tile (middle) or overlap (top), matching
+    # Popovic et al. (2020)'s own "sparser at top due to increasing FoV"
+    # design (Fig. 5) rather than an oversight to fix.
     low_xmin, low_xmax, low_ymin, low_ymax = layer_bounds(0.0)
-    low_x = snap_positions(np.linspace(low_xmin, low_xmax, 5), xs)
-    low_y = snap_positions(np.linspace(low_ymin, low_ymax, 5), ys)
+    low_x = snap_positions(np.linspace(low_xmin, low_xmax, 9), xs)
+    low_y = snap_positions(np.linspace(low_ymin, low_ymax, 9), ys)
 
     middle_xmin, middle_xmax, middle_ymin, middle_ymax = layer_bounds(0.30)
     middle_x = snap_positions(np.linspace(middle_xmin, middle_xmax, 3), xs)
@@ -571,7 +594,7 @@ def _grid_search_3d_impl(
             distance = float(
                 np.linalg.norm(np.asarray(candidate, dtype=float) - current_pose)
             )
-            score = gain / max(distance, step)
+            score = gain / (max(distance, step) ** COST_EXPONENT)
             scored_candidates.append((score, candidate, sensor, measurement_noise))
 
         _, best, best_sensor, best_variance = select_fn(scored_candidates, rng)
@@ -982,16 +1005,37 @@ def trajectory_objective_3d(
     ymin, ymax = np.min(ys), np.max(ys)
     penalty = 0.0
 
+    def _boundary_overshoot(x, y, z):
+        # Magnitude of the worst single boundary violation at this point, 0
+        # if in bounds - mirrors Popovic et al. (2020)'s actual
+        # compute_objective.m penalty (a continuous max(overshoot, 0) ramp
+        # over sampled path points) rather than a flat per-violation
+        # constant, so CMA-ES gets a gradient back toward feasibility
+        # instead of every infeasible candidate looking equally (and
+        # uninformatively) bad.
+        return max(
+            x - (xmax - margin),
+            (xmin + margin) - x,
+            y - (ymax - margin),
+            (ymin + margin) - y,
+            z - zmax,
+            zmin - z,
+            0.0,
+        )
+
+    # Checked on the raw (pre-clip) waypoints so a wildly out-of-bounds
+    # proposal is scored worse than a barely-out-of-bounds one, before
+    # clip_waypoints_continuous_3d collapses both to the same boundary
+    # point above.
     for x, y, z in raw_control_waypoints:
-        if (
-            x < xmin + margin
-            or x > xmax - margin
-            or y < ymin + margin
-            or y > ymax - margin
-            or z < zmin
-            or z > zmax
-        ):
-            penalty -= 1000.0
+        penalty -= _boundary_overshoot(x, y, z)
+
+    # Also checked on the sampled (post-clip) spline path, matching
+    # Popovic's points_meas check - catches a spline bowing outside the
+    # domain between two already-in-bounds control waypoints, which the
+    # vertex-only check above can't see.
+    for x, y, z in spline_path_3d:
+        penalty -= _boundary_overshoot(x, y, z)
 
     if predictive_variance:
         importance_mask = cached_importance_mask
@@ -1005,7 +1049,28 @@ def trajectory_objective_3d(
         variance_reduction = masked_expected_variance_reduction_from_sensor(
             P, importance_mask, sensor, measurement_variances
         )
-        total_score = penalty + variance_reduction
+        # Cost-normalize the gain, mirroring Popovic et al. (2020)'s actual
+        # reference implementation (github.com/marija-p/mav_ipp,
+        # tools/planning/compute_objective.m: obj = -gain/cost + penalty,
+        # cost = trajectory time) rather than the paper's prose description,
+        # which omits this term. Without it, CMA-ES has no reason to prefer
+        # a trajectory reachable in less total travel distance over one that
+        # eked out marginally more raw variance reduction by roaming further
+        # - unlike the grid search (score = gain / max(distance, step)
+        # above), which already penalizes distance per step. total_distance
+        # here is the same start-through-waypoints path length
+        # build_spline_trajectory_3d itself sums into its spline parameter
+        # t, so this mirrors Popovic's single whole-trajectory cost term
+        # (get_trajectory_total_time) rather than the grid search's
+        # per-step one.
+        path_points = np.asarray(
+            [(start_x, start_y, start_z)] + list(control_waypoints), dtype=float
+        )
+        total_distance = float(
+            np.sum(np.linalg.norm(np.diff(path_points, axis=0), axis=1))
+        )
+        cost = max(total_distance, step) ** COST_EXPONENT
+        total_score = penalty + variance_reduction / cost
     else:
         total_score = penalty
         X, Y = np.meshgrid(xs, ys)
@@ -1302,7 +1367,15 @@ def kalman_update(mu, P, sensor, z_meas, R, block_ids=None):
     S = np.asarray(sensor @ projected_cov.T) + measurement_noise_covariance(
         R, sensor.shape[0]
     )
-    K = projected_cov.T @ np.linalg.pinv(S)
+    # Cholesky-first (S is SPD by construction), pinv fallback only on
+    # failure - same pattern as covariance_after_sensor and the
+    # masked_expected_variance_reduction* functions above, which this
+    # function had been the one holdout from.
+    try:
+        solved = spd_solve(S, projected_cov, assume_a="pos")
+    except np.linalg.LinAlgError:
+        solved = np.linalg.pinv(S) @ projected_cov
+    K = solved.T
 
     mu = mu + (K @ v).flatten()
     P = P - K @ projected_cov

@@ -8,30 +8,41 @@ import os
 from pathlib import Path
 import imageio.v2 as imageio
 from matplotlib.patches import Rectangle
-from gaussianprocesstraining import utility_function, sampler, create_plots_and_gifs, kalman_update, initialize_gp, grid_search
-from gaussianprocesstraining import build_sensor_matrix, fov_grid_points, fov_lateral_radius, noise_model
+from gaussianprocesstraining import noise_model, utility_function, sampler, create_plots_and_gifs, kalman_update, initialize_gp, grid_search
+from gaussianprocesstraining import importance_filter, grid_measure, next_best_waypoint, cma_es_refine_waypoints_3d, build_spline_trajectory_3d, fov_lateral_radius, resolution_block_size, grid_search_3d, grid_search_3d_softmax
+from gaussianprocesstraining import (
+    build_correlated_noise_covariance,
+    build_sensor_matrix,
+    noise_model,
+    sample_correlated_sensor_noise,
+)
 from evalmetrics import compute_task_completion, compute_reconstruction_rmse, compute_rmse_time_metrics
-from CMAES_classic_singlemap import dynamics_3d, waypoint_3d
 import torch
 import time
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 step = 2.0
-timealloted = int(os.environ.get("TIMEALLOTED", "400"))
-#beta, alpha, are just for vizualisation. utility is for GP
-beta = 1.5
-alpha = 1.0
+timealloted = int(os.environ.get("TIMEALLOTED", "3000"))
+beta = 1
+alpha = 0.02
 utility_threshold = float(os.environ.get("UTILITY_THRESHOLD", "0.5"))
-planning_horizon = int(os.environ.get("PLANNING_HORIZON", "8"))
-action_horizon = 3  # this is more like replanning horizon
-selected_map = int(os.environ.get("SELECTED_MAP", 55))
-lateral_coverage = step * 2
+planning_horizon = int(os.environ.get("PLANNING_HORIZON", "1"))
+#multiblob map 20 is nice!
+selected_map = int(os.environ.get("SELECTED_MAP", 41))
+samples_per_segment = 5
+execution_chunk = int(os.environ.get("EXECUTION_CHUNK", "5"))
 SENSORNOISE_SEED = int(os.environ.get("SENSORNOISE_SEED", "123"))
-MAPTYPE = os.environ.get("MAPTYPE", "halffield") #choose between "multiblob" and "halffield" or "blob" or "(nothing)" or "NAIP"
-INIT_ALTITUDE = 10
-ZMIN = 10.0
-ZMAX = 40.0
+
+MAPTYPE = os.environ.get("MAPTYPE", "grf") #choose between "multiblob" and "halffield" or "blob" or "(nothing)" or "grf"
+cma_seed = int(os.environ.get("CMA_SEED", "55"))
+USE_SOFTMAX_GRID_SEARCH = False  # False -> original deterministic grid_search_3d (argmax
+                                 # every step, same warm start every replan). True ->
+                                 # grid_search_3d_softmax, which samples the warm start
+                                 # stochastically so replans can diverge into different
+                                 # trajectories. Tune temperature/seed in
+                                 # gaussianprocesstraining.GRID_SEARCH_SOFTMAX_TEMPERATURE
+                                 # / GRID_SEARCH_SOFTMAX_SEED.
 WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "150"))  # <=0 = unconstrained (timestep
                                                                       # loop runs to completion); otherwise
                                                                       # the flight ends at timealloted
@@ -41,14 +52,25 @@ WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "150"))  # <=0 = u
 # Each simulation step is 1 vector step, treated as 1 meter of real flight. At
 # a flight speed of FLIGHT_SPEED_MPS, that step physically takes at least
 # STEP_DISTANCE_METERS / FLIGHT_SPEED_MPS seconds. When ENFORCE_MIN_STEP_TIME
-# is on, a step that computed (dynamics + sensor update) faster than that gets
-# padded with a sleep up to the floor; a step that already took longer is left
-# alone - this is a floor, not a fixed duration.
+# is on, a step that computed (dynamics + any replan + sensor update) faster
+# than that gets padded with a sleep up to the floor; a step that already took
+# longer (e.g. one that triggered a replan) is left alone - this is a floor,
+# not a fixed duration.
 ENFORCE_MIN_STEP_TIME = os.environ.get("ENFORCE_MIN_STEP_TIME", "1") == "1"
 STEP_DISTANCE_METERS = 1.0
-FLIGHT_SPEED_MPS = 3
+FLIGHT_SPEED_MPS = 3.0
 MIN_STEP_SECONDS = STEP_DISTANCE_METERS / FLIGHT_SPEED_MPS
 
+
+
+##MAKING ALTITUDE A THING
+INIT_ALTITUDE = 10.0  # Example fixed altitude for all waypoints
+ZMIN = 10.0
+ZMAX = 40.0
+
+
+#TOTAL PLANNED = PLANNING HORIZON * SPLINE SAMPLES PER SEGMENT
+#TOTAL EXECUTED = EXECUTION CHUNK
 
 """
 Single-map classic grid-search control script.
@@ -56,59 +78,75 @@ Set `selected_map` above to run one map and generate visualizations afterward.
 """
 
 
-# alpha is weight for how costly distance is
+"""
+Planning_horizon = 8
+filtered variances = importance_filter(mu, P, beta, threshold=utility_threshold)
+variances_at_gridpoints = grid_measure(filtered_variances, X, Y, xs, ys)
+waypoint_plan =[]
+curr_x, curr_y = cx, cy
+for i in range(1, planning_horizon+1):
+    best_waypoint = next_best_waypoint(variances_at_gridpoints, curr_x, curr_y)
+    waypoint_plan.append(best_waypoint)
+    curr_x, curr_y = best_waypoint
+
+optim_waypoint_plan = CMA_ES(waypoint_plan, utility_function)
+
+"""
 
 
+def real_receding_horizon_planner(
+    cx,
+    cy,
+    cz,
+    mu,
+    P,
+    xs,
+    ys,
+    utility_threshold,
+    beta,
+    planning_horizon,
+    alpha=0.1,
+    seed = cma_seed
+):
+    grid_search_fn = grid_search_3d_softmax if USE_SOFTMAX_GRID_SEARCH else grid_search_3d
+    flight_plan_3d = grid_search_fn(
+        mu,
+        P,
+        xs,
+        ys,
+        start_pose=(cx, cy, cz),
+        beta=beta,
+        utility_threshold=utility_threshold,
+        planning_horizon=planning_horizon,
+        zmin=ZMIN,
+        zmax=ZMAX,
+        alpha=alpha,
+    )
 
-def grid_spaced_values(start, stop, spacing, step=step):
-    direction = 1.0 if stop >= start else -1.0
-    values = list(np.arange(start, stop + direction * 1e-9, direction * spacing))
-    if not values or not np.isclose(values[-1], stop):
-        values.append(stop)
-    return [float(step * np.round(value / step)) for value in values]
+    control_waypoints = cma_es_refine_waypoints_3d(
+        flight_plan_3d,
+        mu,
+        P,
+        xs,
+        ys,
+        cx,
+        cy,
+        cz,
+        beta,
+        utility_threshold,
+        ZMIN,
+        ZMAX,
+        predictive_variance=True,
+        seed = seed,
 
+    )
 
-def lawnmower_planner(cx, cy, xmin, xmax, ymin, ymax, step=step, buffer=step * 2, fov_radius=lateral_coverage):
-    x_left = xmin + buffer
-    x_right = xmax - buffer
-    y_bottom = ymin + buffer
-    y_top = ymax - buffer
-    sweep_spacing = max(step, step * np.round((2.0 * fov_radius) / step))
-
-    # Snap current position to grid
-    cx = step * np.round(cx / step)
-    cy = step * np.round(cy / step)
-
-    flight_plan = []
-
-    # Build all sweep rows from current y upward
-    y_values = grid_spaced_values(cy, y_top, sweep_spacing, step=step)
-
-    for row_idx, y in enumerate(y_values):
-        if row_idx == 0:
-            x_values = grid_spaced_values(cx, x_right, sweep_spacing, step=step)
-        elif row_idx % 2 == 1:
-            x_values = grid_spaced_values(x_right, x_left, sweep_spacing, step=step)
-        else:
-            x_values = grid_spaced_values(x_left, x_right, sweep_spacing, step=step)
-
-        for x in x_values:
-            waypoint = (float(step * np.round(x / step)), float(step * np.round(y / step)))
-
-            # Avoid immediately adding current position as first target
-            if len(flight_plan) == 0 and np.isclose(waypoint[0], cx) and np.isclose(waypoint[1], cy):
-                continue
-
-            flight_plan.append(waypoint)
-
-    return flight_plan
-
-
+    return control_waypoints
 
 
 
 """
-Assume a very simple waypoint based receding horizon. We aren't even considering dynamics yet.
+Assume a very simple waypoint based planner. We aren't even considering dynamics yet.
 
 This is wrong! This is just a greedy planner. Receding horizon needs to consider total gain over n steps.
 """
@@ -116,7 +154,13 @@ This is wrong! This is just a greedy planner. Receding horizon needs to consider
 #     ...
 
 
+
+'''
+the waypoint() function converts the current position and a goal position into a unit vector direction for the dynamics() function
+'''
+
 def waypoint(cx, cy, goal_x, goal_y, step):
+
     dx = goal_x - cx
     dy = goal_y - cy
     dist = np.hypot(dx, dy)
@@ -130,7 +174,24 @@ def waypoint(cx, cy, goal_x, goal_y, step):
     return grad_x, grad_y, False
 
 
+def waypoint_3d(cx, cy, cz, goal_x, goal_y, goal_z, step):
+    displacement = np.array([
+        goal_x - cx,
+        goal_y - cy,
+        goal_z - cz,
+    ])
+
+    distance = np.linalg.norm(displacement)
+
+    if distance <= step:
+        return 0.0, 0.0, 0.0, True
+
+    direction = displacement / distance
+    return direction[0], direction[1], direction[2], False
+
 def dynamics(cx, cy, grad_x, grad_y, step, samplestep, xmin, xmax, ymin, ymax, buffer=step * 2):
+
+
     # noise = np.random.randint(-1, 2, size=2)
     # cx = np.clip(cx + grad_x * samplestep + noise[0], xmin + buffer, xmax - buffer)
     # cy = np.clip(cy + grad_y * samplestep + noise[1], ymin + buffer, ymax - buffer)
@@ -140,10 +201,52 @@ def dynamics(cx, cy, grad_x, grad_y, step, samplestep, xmin, xmax, ymin, ymax, b
     cy = step * np.round(cy / step)
     return cx, cy
 
+def dynamics_3d(
+    cx, cy, cz,
+    grad_x, grad_y, grad_z,
+    samplestep,
+    xmin, xmax, ymin, ymax,
+    zmin, zmax,
+    buffer,
+):
+    cx = np.clip(cx + grad_x * samplestep, xmin + buffer, xmax - buffer)
+    cy = np.clip(cy + grad_y * samplestep, ymin + buffer, ymax - buffer)
+    cz = np.clip(cz + grad_z * samplestep, zmin, zmax)
+
+    cx = step * np.round(cx / step)
+    cy = step * np.round(cy / step)
+    cz = step * np.round(cz / step)
+
+    return cx, cy, cz
+
+
+def compute_fov(cz, xs, ys, angle_of_view = 60, step=step, cx=None, cy=None):
+
+    radius = fov_lateral_radius(cz, angle_of_view)
+
+    visible_xs = xs[
+        (xs >= cx - radius) &
+        (xs <= cx + radius)
+    ]
+    visible_ys = ys[
+        (ys >= cy - radius) &
+        (ys <= cy + radius)
+    ]
+
+
+    return [
+        (float(x), float(y))
+        for x in visible_xs
+        for y in visible_ys
+        ]
+
+
+
+
 
 if __name__ == "__main__":
     csv_path = Path(os.environ.get("CSV_DIR", str(SCRIPT_DIR / "csv")))
-    output_name = f"lawnmower_map_{MAPTYPE}_{selected_map}_viz"
+    output_name = f"greedy_map_{MAPTYPE}_{selected_map}_viz"
     run_output_tag = os.environ.get("RUN_OUTPUT_TAG")
     if run_output_tag:
         output_name = f"{output_name}_{run_output_tag}"
@@ -152,9 +255,7 @@ if __name__ == "__main__":
     output_dir.mkdir(parents=True, exist_ok=True)
 
     data = np.loadtxt(csv_path / f"map_{selected_map}_{MAPTYPE}_grid_counts.csv", delimiter=",", skiprows=1)
-
     gp, X_test, mean, cov, xs, ys, X, Y, xmin, xmax, ymin, ymax, step = initialize_gp()
-    lateral_coverage = step * 2
 
     pts = data[:, 0:3]
     tol = 1e-9
@@ -176,19 +277,23 @@ if __name__ == "__main__":
 
     rng = np.random.default_rng(SENSORNOISE_SEED + selected_map)
 
-    mean = np.full(X_test.shape[0], utility_threshold + 0.1) #UCB/grf: optimistic prior, everywhere starts unimportant
+    # mu = mean.copy()
+    mean = np.full(X_test.shape[0], utility_threshold + 0.1) ##ATTEMPT - UCB variant (grf)
+    # mean = np.full(X_test.shape[0], utility_threshold - 0.1) ##ATTEMPT - pessimistic prior for LCB/NAIP
     mu = mean.copy()
     P = cov.copy()
-    R = noise_model(INIT_ALTITUDE)
+    R = noise_model(INIT_ALTITUDE)   # measurement noise variance based on altitude
 
     mu_history = []
     P_history = []
     step_numbers = []
     grad_history = []
     pos_history = []
-    pose_history = []
     utility_history = []
     sorted_util_values_list = []
+    planned_path_history = []
+    control_waypoint_history = []
+    pose_history = []
 
     collect_viz_history = os.environ.get("SKIP_VIZ", "0") != "1"
     if collect_viz_history:
@@ -196,30 +301,36 @@ if __name__ == "__main__":
         P_history.append(P.copy())
     step_numbers.append(0)
 
-    initial_utility = utility_function(mu, P, utility_threshold, beta)
+    initial_utility = importance_filter(mu, P, beta, threshold=utility_threshold)
     if collect_viz_history:
         utility_history.append(initial_utility.copy())
+    planned_path_history.append([])
+    control_waypoint_history.append([])
 
     save_every = 5
+    lateral_coverage = step * 2
     samplestep = step
 
     cx, cy, cz = 4.0, 4.0, INIT_ALTITUDE
-    sensor_footprint_radius = fov_lateral_radius(cz)
-    grad_x, grad_y = 0.0, 0.0
+    grad_x, grad_y, grad_z = 0.0, 0.0, 0.0
     pos_history.append((cx, cy))
     pose_history.append((cx, cy, cz))
+    fov = compute_fov(cz = cz, xs = xs, ys = ys, angle_of_view=60, step=step, cx=cx, cy=cy)
 
     initial_var_field = np.diag(P).reshape(X.shape)
     if collect_viz_history:
         gy0, gx0 = np.gradient(initial_var_field, Y[:, 0], X[0, :])
         grad_history.append((gx0, gy0))
-        sorted_util_values_list.append(grid_search(X, Y, cx, cy, [initial_utility]))
+        sorted_util_values_list.append(grid_measure(initial_utility, xs, ys))
 
     initial_total_variance = np.sum(np.diag(P))
     variance_history = [initial_total_variance]
     print(f"Map {selected_map}: Initial total variance: {initial_total_variance:.4f}")
 
     utility = initial_utility
+    control_waypoints = []
+    spline_path = []
+    spline_idx = 0
 
     rmselist = []
     global_rmselist = []
@@ -245,72 +356,108 @@ if __name__ == "__main__":
         step_start_time = time.time()
 
         if ts <= 1:
-            grad_x, grad_y, grad_z, waypoint_reached = waypoint_3d(
-                cx, cy, cz, goal_x=80.0, goal_y=80.0, goal_z=INIT_ALTITUDE, step=step
-            )
-            cx, cy, cz = dynamics_3d(
-                cx, cy, cz, grad_x, grad_y, grad_z, samplestep, xmin, xmax, ymin, ymax, ZMIN, ZMAX, buffer=step * 2
-            )
+            grad_x, grad_y, waypoint_reached = waypoint(cx, cy, goal_x=80.0, goal_y=80.0, step=step)
+            cx, cy = dynamics(cx, cy, grad_x, grad_y, step, samplestep, xmin, xmax, ymin, ymax)
             pos_history.append((cx, cy))
             pose_history.append((cx, cy, cz))
             step_numbers.append(ts + 1)
+            planned_path_history.append([])
+            control_waypoint_history.append([])
         else:
-            if ts == 2:
-                flight_plan = lawnmower_planner(
+            if ts == 2 or spline_idx >= execution_chunk or spline_idx >= len(spline_path):
+                start_time = time.time()
+                control_waypoints = real_receding_horizon_planner(
                     cx,
                     cy,
-                    xmin,
-                    xmax,
-                    ymin,
-                    ymax,
-                    step=step,
-                    fov_radius=sensor_footprint_radius,
+                    cz,
+                    mu,
+                    P,
+                    xs,
+                    ys,
+                    utility_threshold,
+                    beta,
+                    planning_horizon,
+                    alpha=alpha,
+                    seed=cma_seed,
+                )
+                end_time = time.time()
+                spline_path = build_spline_trajectory_3d(
+                    cx, cy, cz, control_waypoints, samples_per_segment=samples_per_segment
+                )
+                spline_idx = 0
+
+                print("Replanning...")
+                print(f"Replanning time: {end_time - start_time:.4f} seconds")
+                print("Control waypoints:", control_waypoints)
+
+            if spline_idx < len(spline_path):
+                goal_x, goal_y, goal_z = spline_path[spline_idx]
+                grad_x, grad_y, grad_z, waypoint_reached = waypoint_3d(
+                    cx, cy, cz, goal_x=goal_x, goal_y=goal_y, goal_z=goal_z, step=step
                 )
 
-            if os.environ.get("PRINT_FLIGHT_PLAN", "0") == "1":
-                print("Current flight plan:", flight_plan)
-            if len(flight_plan) > 0:
-                grad_x, grad_y, grad_z, waypoint_reached = waypoint_3d(
-                    cx, cy, cz, goal_x=flight_plan[0][0], goal_y=flight_plan[0][1], goal_z=INIT_ALTITUDE, step=step
-                )
                 if waypoint_reached:
-                    flight_plan.pop(0)
-                    if os.environ.get("PRINT_WAYPOINT_EVENTS", "0") == "1":
-                        print("Waypoint reached.")
-                    if len(flight_plan) > 0:
+                    spline_idx += 1
+                    if spline_idx < len(spline_path):
+                        goal_x, goal_y, goal_z = spline_path[spline_idx]
                         grad_x, grad_y, grad_z, _ = waypoint_3d(
-                            cx, cy, cz, goal_x=flight_plan[0][0], goal_y=flight_plan[0][1], goal_z=INIT_ALTITUDE, step=step
+                            cx, cy, cz, goal_x=goal_x, goal_y=goal_y, goal_z=goal_z, step=step
                         )
                     else:
                         grad_x, grad_y, grad_z = 0.0, 0.0, 0.0
+
+                if spline_idx < len(spline_path):
+                    x_next, y_next, z_next = spline_path[spline_idx]
+                    padding = step * 2
+                    clamped_x = min(max(x_next, xmin + padding), xmax - padding)
+                    clamped_y = min(max(y_next, ymin + padding), ymax - padding)
+                    clamped_z = min(max(z_next, ZMIN), ZMAX)
+                    if (
+                        clamped_x != x_next
+                        or clamped_y != y_next
+                        or clamped_z != z_next
+                    ):
+                        spline_path[spline_idx] = [
+                            clamped_x,
+                            clamped_y,
+                            clamped_z,
+                        ]
+                        print("Flight plan waypoint was out of bounds and was clamped back into the padded map region.")
+
+                cx, cy, cz = dynamics_3d(cx, cy, cz, grad_x, grad_y, grad_z, samplestep, xmin, xmax, ymin, ymax, ZMIN, ZMAX, buffer=step/2)
+                pos_history.append((cx, cy))
+                pose_history.append((cx, cy, cz))
+                step_numbers.append(ts + 1)
+                planned_path_history.append([(x, y) for x, y, _ in spline_path[spline_idx:]])
+                control_waypoint_history.append([(x, y) for x, y, _ in control_waypoints])
             else:
-                grad_x, grad_y, grad_z = 0.0, 0.0, 0.0
+                pos_history.append((cx, cy))
+                pose_history.append((cx, cy, cz))
+                step_numbers.append(ts + 1)
+                planned_path_history.append([])
+                control_waypoint_history.append([])
 
+        fov = compute_fov(cz = cz, xs = xs, ys = ys, angle_of_view=60, step=step, cx=cx, cy=cy)
 
+        sensor, sensor_block_ids = build_sensor_matrix(
+            fov, cz, xs, ys, return_block_ids=True
+        )
 
-            cx, cy, cz = dynamics_3d(
-                cx, cy, cz, grad_x, grad_y, grad_z, samplestep, xmin, xmax, ymin, ymax, ZMIN, ZMAX, buffer=step * 2
-            )
-            pos_history.append((cx, cy))
-            pose_history.append((cx, cy, cz))
-            step_numbers.append(ts + 1)
-
-        fov = fov_grid_points(cx, cy, cz, xs, ys)
-        sensor = build_sensor_matrix(fov, cz, xs, ys)
-        R = noise_model(cz)
-
+        R = noise_model(cz)  # Update measurement noise based on current altitude
         z_meas = sensor @ true_map_flat
-        z_meas += rng.normal(0, np.sqrt(R), size=sensor.shape[0])
+        z_meas += sample_correlated_sensor_noise(sensor_block_ids, R, rng)
+        R_cov = build_correlated_noise_covariance(sensor_block_ids, R)
+        mu, P = kalman_update(
+            mu, P, sensor, z_meas, R_cov, block_ids=sensor_block_ids
+        )
+        utility = importance_filter(mu, P, beta, threshold=utility_threshold)
 
-        mu, P = kalman_update(mu, P, sensor, z_meas, R)
-        utility = utility_function(mu, P, utility_threshold, beta=beta)
         variance_history.append(float(np.sum(np.diag(P))))
-
         if collect_viz_history:
             mu_history.append(mu.copy())
             P_history.append(P.copy())
             utility_history.append(utility.copy())
-            sorted_util_values_list.append(grid_search(X, Y, cx, cy, [utility]))
+            sorted_util_values_list.append(grid_measure(utility, xs, ys))
 
             var_field = np.diag(P).reshape(X.shape)
             gy, gx = np.gradient(var_field, Y[:, 0], X[0, :])
@@ -319,19 +466,20 @@ if __name__ == "__main__":
         util = utility.reshape(len(ys), len(xs))
         # print(util, "shape:", util.shape)
 
+
         reconstruction_metrics = compute_reconstruction_rmse(
-            mu=mu,
-            pts=pts,
-            xs=xs,
-            ys=ys,
-            step=step,
-            utility_threshold=utility_threshold,
-            xmin=xmin,
-            ymin=ymin,
+        mu=mu,
+        pts=pts,
+        xs=xs,
+        ys=ys,
+        step=step,
+        utility_threshold=utility_threshold,
+        xmin=xmin,
+        ymin=ymin,
         )
 
-        rmselist.append(reconstruction_metrics["occupied_rmse"])
-        global_rmselist.append(reconstruction_metrics["global_rmse"])
+        rmselist.append(reconstruction_metrics['occupied_rmse'])
+        global_rmselist.append(reconstruction_metrics['global_rmse'])
         if ENFORCE_MIN_STEP_TIME:
             step_elapsed = time.time() - step_start_time
             if step_elapsed < MIN_STEP_SECONDS:
@@ -399,7 +547,7 @@ if __name__ == "__main__":
     plt.plot(variancelist, label="Global Variance")
     plt.xlabel("Timestep")
     plt.ylabel("Global Variance")
-    plt.title(f"Map {selected_map} - Lawnmower Variance over Timesteps")
+    plt.title(f"Map {selected_map} - Variance over Timesteps")
     plt.legend()
     plt.savefig(output_dir / f"map_{selected_map}_var.png")
     plt.close()
@@ -408,21 +556,13 @@ if __name__ == "__main__":
     plt.plot(wall_time_arr, variance_per_step, label="Global Variance")
     plt.xlabel("Wall-clock time (s)")
     plt.ylabel("Global Variance")
-    plt.title(f"Map {selected_map} - Lawnmower Variance over Wall Time")
+    plt.title(f"Map {selected_map} - Variance over Wall Time")
     plt.legend()
     plt.savefig(output_dir / f"map_{selected_map}_var_walltime.png")
     plt.close()
 
     final_variance = np.sum(np.diag(P))
     variance_delta = initial_total_variance - final_variance
-    print(f"Map {selected_map}: Final total variance: {final_variance:.4f}")
-    print(f"Map {selected_map}: Variance reduction: {variance_delta:.4f}")
-    if stopped_early:
-        print(
-            f"Map {selected_map}: flight ended early after "
-            f"{time.time() - flight_start_time:.1f}s due to the wall-clock budget "
-            f"(completed {len(rmselist)} of {timealloted} timesteps)."
-        )
 
     if os.environ.get("SKIP_VIZ", "0") != "1":
         create_plots_and_gifs(
@@ -440,13 +580,17 @@ if __name__ == "__main__":
             ys,
             cx,
             cy,
-            sensor_footprint_radius,
+            lateral_coverage,
             xmin,
             xmax,
             ymin,
             ymax,
             plot_utility=True,
             plot_grad=False,
+            planned_path_history=planned_path_history,
+            control_waypoint_history=control_waypoint_history,
+            pose_history=pose_history,
+            angle_of_view=60.0,
         )
 
     metrics = compute_task_completion(
@@ -455,7 +599,7 @@ if __name__ == "__main__":
         xs=xs,
         ys=ys,
         step=step,
-        lateral_coverage=sensor_footprint_radius,
+        lateral_coverage=lateral_coverage,
         xmin=xmin,
         ymin=ymin,
     )
@@ -464,6 +608,7 @@ if __name__ == "__main__":
         f"Total Utility = {metrics['total_true_utility']:.4f}, "
         f"Task Completion = {metrics['task_completion']:.4%}"
     )
+
 
     print(
         f"Map {selected_map}: Global RMSE = {reconstruction_metrics['global_rmse']:.4f}, "
@@ -480,3 +625,13 @@ if __name__ == "__main__":
         f"Map {selected_map}: Occupied RMSE AUC = {occupied_rmse_time['auc_rmse']:.4f}, "
         f"Mean = {occupied_rmse_time['mean_rmse']:.4f}"
     )
+    print(
+        f"Map {selected_map}: Final total variance: {final_variance:.4f}, "
+        f"Variance reduction: {variance_delta:.4f}"
+    )
+    if stopped_early:
+        print(
+            f"Map {selected_map}: flight ended early after "
+            f"{time.time() - flight_start_time:.1f}s due to the wall-clock budget "
+            f"(completed {len(rmselist)} of {timealloted} timesteps)."
+        )

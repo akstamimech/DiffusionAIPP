@@ -25,14 +25,14 @@ step = 2.0
 timealloted = 100
 beta = 1
 alpha = 0.02
-utility_threshold = 0.3
+utility_threshold = 0.5
 planning_horizon = 8
 # action_horizon = 3  # this is more like replanning horizon
 selected_map = int(os.environ.get("SELECTED_MAP", 37))
 samples_per_segment = 5
 execution_chunk = 10
 SENSORNOISE_SEED = 123
-MAPTYPE = os.environ.get("MAPTYPE", "NAIP") #choose between "multiblob" and "halffield" or "blob" or "(nothing)" or "NAIP"
+MAPTYPE = os.environ.get("MAPTYPE", "grf") #choose between "multiblob" and "halffield" or "blob" or "(nothing)" or "NAIP"
 random_seed = 55
 USE_SOFTMAX_GRID_SEARCH = False  # False -> original deterministic grid_search_3d (argmax
                                  # every step, same warm start every replan). True ->
@@ -247,7 +247,7 @@ if __name__ == "__main__":
     rng = np.random.default_rng(SENSORNOISE_SEED + selected_map)
 
     # mu = mean.copy()
-    mean = np.full(X_test.shape[0], utility_threshold - 1.0) ##ATTEMPT
+    mean = np.full(X_test.shape[0], utility_threshold + 1.0) ##ATTEMPT
     mu = mean.copy()
     P = cov.copy()
     R = noise_model(INIT_ALTITUDE)   # measurement noise variance based on altitude

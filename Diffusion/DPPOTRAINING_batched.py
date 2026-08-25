@@ -95,7 +95,7 @@ REPO_DIR = SCRIPT_DIR
 if str(REPO_DIR) not in sys.path:
     sys.path.insert(0, str(REPO_DIR))
 
-from gaussianprocesstraining import initialize_gp
+from gaussianprocesstraining import initialize_gp, importance_filter
 from evalmetrics import compute_reconstruction_rmse
 from Diffusionplanner_singlemap import build_true_map_flat
 
@@ -110,15 +110,17 @@ import dppo_rollout_worker
 # ---------------------------------------------------------------------------
 
 SENSORNOISE_SEED = 123
-MAPTYPE = os.environ.get("MAPTYPE", "NAIP")
+MAPTYPE = os.environ.get("MAPTYPE", "grf")
 # NOTE: REPO_DIR is Diffusion/ (this file's own directory), but the map CSVs live one level up,
 # at scripts/csv - REPO_DIR/"csv" would silently point at a directory that doesn't exist.
 CSV_PATH = SCRIPT_DIR / "csv"
-UTILITY_THRESHOLD = 0.3
+UTILITY_THRESHOLD = 0.5  # must match Diffusionplanner_singlemap.py's utility_threshold
 SAMPLESTEP = 2.0
 
 # T_a in the paper's terms: measurement updates executed per environment step before replanning.
-EXECUTION_CHUNK = 10
+# Must match Diffusionplanner_singlemap.py's execution_chunk (now 20) - see the §5.2-class bug
+# this class of drift caused before: training replanning at a different cadence than deployment.
+EXECUTION_CHUNK = 40
 # T in the paper's terms: number of execute-then-replan environment steps per episode.
 # NOTE: this is now numerically equal to diffusion.T (=30, the denoising-step count) - a
 # coincidence of matching the batch-size scaling validated in the user's 10-iteration trial, not
@@ -126,48 +128,55 @@ EXECUTION_CHUNK = 10
 # loop count in collect_rollouts_batched, diffusion.T is the INNER per-replan denoising-step count
 # in ddpo_ddim_sample_timestep. Just don't assume "step 30" in a log line means the same thing in
 # both contexts.
-ENV_HORIZON = 40
+ENV_HORIZON = 8
 
 # K' in the paper's terms (Section 4.3, "Fine-tune only the last few denoising steps"): the
-# full K=diffusion.T=30-step denoising chain still runs every replan (needed to get a coherent
+# full K=diffusion.T=20-step denoising chain still runs every replan (needed to get a coherent
 # sample at all), but only the transitions from the LAST NUM_FINE_TUNE_STEPS steps (closest to
 # k=0, the terminal/least-noisy step) get stored in the buffer and trained on - the early,
 # noisiest steps are treated as frozen/untouched, matching the paper's theta vs theta_FT split
 # (though we don't maintain a literal separate frozen copy of the weights, just skip recording
 # and gradient-updating on those early steps).
-NUM_FINE_TUNE_STEPS = 12
+NUM_FINE_TUNE_STEPS = 7
 
-# Reward: DENSE, PURE WHOLE-GRID VARIANCE SEEKING, map-agnostic. Every environment step is scored
-# by the whole-grid posterior variance REMAINING after its chunk, as a concave fraction of the GP
-# prior's total variance:
-#     reward_t = -VARIANCE_WEIGHT * (variance_after_global / baseline_total_variance)^CONCAVITY_FACTOR
-# This is the simple dense variance term this file used before the terminal-only rework, stripped
-# to a single pure-variance objective (the RMSE, occupied-mask, and STEP_PENALTY terms are all
-# dropped). Goal, stated plainly: reduce total posterior variance as much (and, via the concave
-# per-step level, as early) as possible.
-#   - Map-agnostic: variance_after_global is the WHOLE grid (no interest mask), and
-#     baseline_total_variance is trace(P0) of the GP prior, which initialize_gp() makes identical
-#     for every map - so this is literally the same function on every map. The map-specific
-#     WHERE-to-look competence comes from the BC prior (which clones a map-content-aware expert);
-#     DPPO only amplifies total uncertainty reduction.
+# Reward: DENSE, BELIEF-MASKED OCCUPIED VARIANCE SEEKING, map-agnostic. Every environment step is
+# scored by the posterior variance REMAINING after its chunk, summed only over cells the CURRENT
+# belief (not the ground truth) still flags as important via importance_filter, as a concave
+# fraction of the GP prior's total variance:
+#     mask_t = importance_filter(mu_after, P_after, beta=UCB_BETA, threshold=UTILITY_THRESHOLD) > 0
+#     reward_t = -VARIANCE_WEIGHT * (sum(diag(P_after)[mask_t]) / baseline_total_variance)^CONCAVITY_FACTOR
+# Goal, stated plainly: reduce posterior variance, restricted to wherever the belief itself still
+# thinks matters, as much (and, via the concave per-step level, as urgently once nearly converged)
+# as possible.
+#   - Belief-masked, not ground-truth-masked: importance_filter is exactly what the BC-cloned
+#     expert's own trajectory objective already optimizes against (masked_expected_variance_
+#     reduction_from_sensor), so DPPO now fine-tunes the SAME objective the policy was cloned to
+#     pursue, rather than a different (whole-grid) one. It also only uses information the policy's
+#     own belief actually has - never the true map - unlike the ground-truth occupied_mask used for
+#     logging/eval below.
+#   - Denominator stays baseline_total_variance (trace(P0), fixed at mission start, identical
+#     across every map): under the current GRF/UCB prior mu0 = UTILITY_THRESHOLD + 0.1 already
+#     exceeds the threshold everywhere before beta*sigma is even added, so the INITIAL belief mask
+#     is provably the whole grid on every map - trace(P0[initial_mask]) == trace(P0) - so this
+#     fixed, map-agnostic denominator is already exactly right; only the numerator needs to be
+#     masked. Summed (via GAE) across a mission's replans, this is a concave reshaping of the same
+#     occupied-variance-AUC metric already used for evaluation throughout the thesis.
 #   - Dense, not terminal: rolled back from the terminal-only reward deliberately - a per-step
 #     signal is easier for the critic/PPO to assign credit against than one propagated terminal
 #     scalar, which is the likelier cause of slow learning.
-#   - CENTER-BIAS CAVEAT: whole-grid variance has a measured ~2x per-measurement bias toward
-#     central measurements (an interior FOV footprint / kernel spillover is never clipped by the
-#     map boundary). The bias DECAYS as the belief evolves (a central measurement over an
-#     already-resolved center drops almost nothing), so the concave level reward pushes the policy
-#     outward once the center is resolved rather than camping there - but this is the reward most
-#     prone to center-concentration, so watch plot_iteration_trajectory. To restore the
-#     center-bias-free terminal masked reward, see compute_step_reward (one branch to swap back).
+#   - CENTER-BIAS NOTE: the previous pure-whole-grid version of this reward had a measured ~2x
+#     per-measurement bias toward central measurements (an interior FOV footprint / kernel
+#     spillover is never clipped by the map boundary). Masking by current importance should reduce
+#     this directly: once a central cell's posterior mean crosses the threshold it drops out of the
+#     mask entirely, so re-measuring an already-resolved center stops contributing to the reward at
+#     all (not just diminishing marginally) - still worth watching via plot_iteration_trajectory.
 # RMSE stays out of the reward: it depends on true-map content and the noise draw, not just where
 # you flew - noisier than variance for the same flight path (the Kalman covariance update depends
 # only on measurement geometry).
 VARIANCE_WEIGHT = 1.0  # single-term reward + advantage normalization => this is scale-only
 CONCAVITY_FACTOR = 0.5
-# UCB_BETA: retained only so the belief-masked variance reward (mu - UCB_BETA*sigma <= threshold)
-# can be restored by editing compute_step_reward. Currently UNUSED by the live pure-whole-grid
-# reward.
+# beta for the reward's own importance_filter call - same conventional value (one std-dev
+# confidence bound) used by the planner scripts' own BETA default.
 UCB_BETA = 1.0
 
 NUM_PPO_EPOCHS = 7
@@ -261,11 +270,11 @@ NUM_ROLLOUT_WORKERS = NUM_EPISODES_PER_ITERATION
 # Map pool DPPO trains against, for generalization rather than overfitting to one fixed map.
 # Every training rollout draws its map from TRAIN_MAP_IDS (see _sample_episode_envs); VAL_MAP_IDS
 # is held out entirely from training rollouts and used only by evaluate_generalization for an
-# honest unseen-map check. Map 11 (this file's original single fixed map, validated in the
-# user's 10-iteration trial) is kept in VAL_MAP_IDS so there's continuity with that baseline.
-TRAIN_MAP_IDS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 
-                 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44]
-VAL_MAP_IDS = [45, 46, 47, 48, 49]
+# honest unseen-map check. Matches the thesis's own GRF convention: 50 training maps (0-49) with
+# maps 51-60 held out for evaluation across all benchmarks (map 50 is left out of both pools to
+# match compare_multimap_all_planners.py's DEFAULT_MAPS boundary).
+TRAIN_MAP_IDS = list(range(0, 50))
+VAL_MAP_IDS = list(range(51, 61))
 # Starting heading/velocity for every episode - a raw (unnormalized) world-frame direction
 # vector, not literally unit-length; normalize_xyz_displacement handles scaling it into the
 # model's conditioning space. NOTE: with the warmup below this is now only a placeholder for the
@@ -297,7 +306,7 @@ VAL_EVAL_EVERY = 10
 # likelihood divides by this value, raising it from 0.1 to 0.3 cuts that sensitivity by
 # (0.3/0.1)^2 = 9x. This was the main lever that brought approx_kl comfortably under TARGET_KL
 # in the user's 10-iteration trial.
-SIGMA_PROB_MIN = 0.3
+SIGMA_PROB_MIN = 0.2
 # Floor on the std of the noise ACTUALLY ADDED during rollout sampling (DPPO paper section 4.3's
 # min_sampling_denoising_std; AID ships 0.05). Distinct from SIGMA_PROB_MIN, which only affects
 # the likelihood used for the PPO ratio: without this floor, the schedule-derived posterior
@@ -323,7 +332,7 @@ LOGPROB_CLAMP_MAX = 2.0
 N_CRITIC_WARMUP_ITERATIONS = 2
 
 DEFAULT_CHECKPOINT = (
-    SCRIPT_DIR / "behaviouralcloninginstance" / "current_best_bc.pth"
+    SCRIPT_DIR / "checkpoints" / "current_best.pth"
 )
 
 # Toggle: dump a top-down + 3D trajectory plot of one representative pooled episode after every
@@ -466,6 +475,10 @@ def build_environment(map_id, gp_prior=None, cx0=None, cy0=None, cz0=None, headi
     if gp_prior is None:
         gp_prior = initialize_gp()
     gp, X_test, mean, cov, xs, ys, X, Y, xmin, xmax, ymin, ymax, grid_step = gp_prior
+    # initialize_gp()'s own mean is raw GP-prior zero; Diffusionplanner_singlemap.py overrides it
+    # to utility_threshold + 0.1 (UCB/grf: cells start optimistically-unimportant) before its first
+    # measurement - match that override here so training and deployment start from the same belief mean.
+    mean = np.full_like(mean, UTILITY_THRESHOLD + 0.1)
 
     # Corner start matching Diffusionplanner_singlemap.py (cx,cy,cz = 4,4,INIT_ALTITUDE), not the
     # old map-center start - see START_XY/INIT_ALTITUDE. The warmup in collect_rollouts_batched
@@ -578,29 +591,27 @@ def _rmse_metrics(mu, env):
 
 
 def compute_step_reward(mu_before, mu_after, P_before, P_after, env, env_step):
-    """Step 2: DENSE pure whole-grid variance reward (see VARIANCE_WEIGHT's comment). EVERY
-    environment step is scored by the whole-grid posterior variance remaining after its chunk:
+    """Step 2: DENSE belief-masked occupied-variance reward (see VARIANCE_WEIGHT's comment block
+    above for the full rationale). EVERY environment step is scored by the posterior variance
+    remaining after its chunk, summed only over cells the CURRENT belief still flags as important:
 
-        -VARIANCE_WEIGHT * (variance_after_global / baseline_total_variance)^CONCAVITY_FACTOR
+        mask = importance_filter(mu_after, P_after, beta=UCB_BETA, threshold=UTILITY_THRESHOLD) > 0
+        -VARIANCE_WEIGHT * (sum(diag(P_after)[mask]) / baseline_total_variance)^CONCAVITY_FACTOR
 
-    variance_after_global sums np.diag(P_after) over the ENTIRE grid (no interest mask), and
-    baseline_total_variance is trace(P0) of the GP prior - which initialize_gp() makes identical
-    for every map - so this reward is literally the same function on every map. Map-specific
-    WHERE-to-look competence comes from the BC prior; DPPO only amplifies total uncertainty
-    reduction.
-
-    To restore the belief-masked TERMINAL variant, gate on the episode's last step and sum only
-    over the interest mask, e.g.:
-        sigma = np.sqrt(np.diag(P_after))
-        mask = (mu_after - UCB_BETA * sigma) <= UTILITY_THRESHOLD
-        v = float(np.sum(np.diag(P_after)[mask if mask.any() else slice(None)]))
-        reward = -VARIANCE_WEIGHT * (v / env.baseline_total_variance) ** CONCAVITY_FACTOR  # if last step else 0
+    This is belief-masked, not ground-truth-masked: it's exactly the same importance criterion the
+    BC-cloned expert's own trajectory objective already optimizes against, using only information
+    the policy's own belief has (never the true map). baseline_total_variance (trace(P0), fixed at
+    mission start) stays the denominator unchanged from the whole-grid version - under the current
+    GRF/UCB prior the initial belief mask is provably the whole grid on every map, so this
+    map-agnostic fixed denominator is already exactly right; only the numerator is masked.
 
     mu_before/P_before are unused (the reward scores the post-chunk level, not the drop) but kept
     in the signature so the call site doesn't have to change shape.
 
-    Returns (reward, global_rmse, occupied_rmse, variance_global, variance_occupied) - the RMSE and
-    occupied-variance values are computed for logging and checkpoint selection, not the reward.
+    Returns (reward, global_rmse, occupied_rmse, variance_global, variance_occupied) - global_rmse,
+    occupied_rmse (ground-truth-masked), and variance_global/variance_occupied are all computed for
+    logging and checkpoint selection only, not the reward - see plot_iteration_trajectory,
+    evaluate_generalization.
     """
 
     after_metrics = _rmse_metrics(mu_after, env)
@@ -611,8 +622,12 @@ def compute_step_reward(mu_before, mu_after, P_before, P_after, env, env_step):
     variance_after_global = float(np.sum(np.diag(P_after)))
     variance_after_occupied = float(np.sum(np.diag(P_after)[occupied_mask]))
 
+    belief_utility = importance_filter(mu_after, P_after, beta=UCB_BETA, threshold=UTILITY_THRESHOLD)
+    belief_mask = belief_utility > 0
+    variance_after_belief = float(np.sum(np.diag(P_after)[belief_mask]))
+
     reward = -VARIANCE_WEIGHT * (
-        variance_after_global / env.baseline_total_variance
+        variance_after_belief / env.baseline_total_variance
     ) ** CONCAVITY_FACTOR
 
     return (
@@ -741,10 +756,12 @@ def _denoising_schedule(num_steps=None):
 def _sample_episode_envs(train_envs, num_episodes, iteration):
     """Picks which map each of this iteration's `num_episodes` pooled episodes trains against.
     Concatenates whole shuffled passes over `train_envs` (reshuffled each pass) rather than
-    sampling every slot i.i.d., so every map in the pool gets seen roughly equally often per
-    iteration instead of some maps being over/under-represented by chance - this matters more
-    here than usual since num_episodes (16) is larger than the map pool (10), so every map is
-    guaranteed to appear at least once, with only a few repeats to fill out the remainder.
+    sampling every slot i.i.d., so within any one pass every map gets seen at most once before any
+    map repeats. With the current pool (TRAIN_MAP_IDS, 50 maps) bigger than num_episodes (32), the
+    loop below only ever runs one pass: each iteration trains on 32 distinct maps drawn from a
+    fresh shuffle of all 50, and the other 18 sit out that round entirely - there's no repeat
+    within a round, but also no persistent cross-iteration cursor, so coverage across iterations is
+    even on average (each map ~32/50 = 64% likely per round) rather than a strict round-robin.
     Seeded off `iteration` so a given iteration's map assignment is reproducible across reruns."""
     rng = random.Random(iteration)
     envs = []

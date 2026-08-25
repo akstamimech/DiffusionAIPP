@@ -18,7 +18,7 @@ for id in range(0, dataset_id_range + 1):
     xmin, xmax = 0.0, 100.0
     ymin, ymax = 0.0, 100.0
     step = 1.0          
-    radius = 8.0        
+    radius = 6.0        
     r2 = radius**2
 
     xs = np.arange(xmin, xmax + 1e-9, step)
@@ -44,7 +44,7 @@ for id in range(0, dataset_id_range + 1):
     #     cmap="hot"
     # )
 
-    # plt.colorbar(label="number of trees within radius 8")
+    # plt.colorbar(label="number of trees within radius 4")
     # # plt.scatter(pts[:,0], pts[:,1], s=8, color="blue")
     # plt.title(f"multiblob Map {id} - Density Heatmap")
     # plt.xlabel("X coordinate")

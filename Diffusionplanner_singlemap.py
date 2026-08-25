@@ -29,19 +29,24 @@ DIFFUSION_DIR = SCRIPT_DIR / "Diffusion"
 if str(DIFFUSION_DIR) not in sys.path:
     sys.path.insert(0, str(DIFFUSION_DIR))
 
+# The model modules derive every inference normalization statistic from this
+# dataset at import time.  Use the GRF training distribution by default while
+# retaining DIFFUSION_DATASET_PATH as an explicit override.
+GRF_DATASET_PATH = SCRIPT_DIR / "dataset_grf_60.pt"
+os.environ.setdefault("DIFFUSION_DATASET_PATH", str(GRF_DATASET_PATH))
+
 from sample_3d_sparse_trans_diffusion import diffusion
 
 
-#NAIP 41 is a very nice map tbh
 step = 2.0
-timealloted = int(os.environ.get("TIMEALLOTED", "3000"))
+timealloted = int(os.environ.get("TIMEALLOTED", "4000"))
 beta = 1.0
 alpha = 0.02
 utility_threshold = float(os.environ.get("UTILITY_THRESHOLD", "0.5"))
 planning_horizon = int(os.environ.get("PLANNING_HORIZON", "8"))
-selected_map = int(os.environ.get("SELECTED_MAP", 53))
+selected_map = int(os.environ.get("SELECTED_MAP", 55))
 samples_per_segment = 5
-execution_chunk = int(os.environ.get("EXECUTION_CHUNK", 40))
+execution_chunk = int(os.environ.get("EXECUTION_CHUNK", 20))
 SENSORNOISE_SEED = int(os.environ.get("SENSORNOISE_SEED", "123"))
 MAPTYPE = os.environ.get("MAPTYPE", "grf")
 CHUNK_SIZE = 256
@@ -54,7 +59,7 @@ if RUN_SEED_ENV is not None:
     torch.manual_seed(RUN_SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(RUN_SEED)
-WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "300"))  # <=0 = unconstrained (timestep
+WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "150"))  # <=0 = unconstrained (timestep
                                                                       # loop runs to completion); otherwise
                                                                       # the flight ends at timealloted
                                                                       # timesteps OR this many real
@@ -75,14 +80,17 @@ MIN_STEP_SECONDS = STEP_DISTANCE_METERS / FLIGHT_SPEED_MPS
 diffusion_path = Path(
     os.environ.get(
         "DIFFUSION_CHECKPOINT",
-        str(SCRIPT_DIR / "checkpoints" / "current_best.pth"),
+        # str(SCRIPT_DIR / "Diffusion" / "checkpoints" / "current_best_updated.pth"),
+        str(SCRIPT_DIR / "Diffusion" / "checkpoints" / "sparse_trans_waypoints_epoch_1500_headingremoved.pth"),
     )
 )
-# diffusion_path = DIFFUSION_DIR / "checkpoints" / "dppo_best.pth"
+
 INIT_ALTITUDE = 10.0
 ZMIN = diffusion.Z_MIN
 ZMAX = diffusion.Z_MAX
 ANGLE_OF_VIEW = 60.0
+START_X = float(os.environ.get("START_X", "4.0"))
+START_Y = float(os.environ.get("START_Y", "4.0"))
 
 """
 Single-map diffusion verification copy of receding_gridsearch_diffusion.py.
@@ -377,7 +385,8 @@ if __name__ == "__main__":
 
     rng = np.random.default_rng(SENSORNOISE_SEED + selected_map)
 
-    mean = np.full(X_test.shape[0], utility_threshold + 0.1) #IF LCB WE NEED TO SWITCH THIS
+    # Under GRF/UCB, the optimistic prior starts above the importance threshold.
+    mean = np.full(X_test.shape[0], utility_threshold + 0.1)
     mu = mean.copy()
     P = cov.copy()
 
@@ -409,7 +418,7 @@ if __name__ == "__main__":
     lateral_coverage = step * 2
     samplestep = step
 
-    cx, cy, cz = 4.0, 4.0, INIT_ALTITUDE
+    cx, cy, cz = START_X, START_Y, INIT_ALTITUDE
     grad_x, grad_y, grad_z = 0.0, 0.0, 0.0
     current_heading_velocity = np.zeros(3, dtype=np.float32)
     pos_history.append((cx, cy))
