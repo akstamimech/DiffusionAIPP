@@ -5,17 +5,17 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # --- Set which map to visualize here ---
-MAPTYPE = os.environ.get("MAPTYPE", "multiblob")  # "NAIP", "multiblob", "halffield", "blob",
+MAPTYPE = os.environ.get("MAPTYPE", "multiblob_normalized")  # "NAIP", "multiblob", "halffield", "blob",
                                               # "safecast_poly_normalized_multiblob", or ""
                                               # for the untyped default grid_counts.csv
-selected_map = int(os.environ.get("SELECTED_MAP", 20))
+selected_map = int(os.environ.get("SELECTED_MAP", 21))
 
 CSV_DIR = Path(__file__).resolve().parent / "csv"
 
 
 def load_map(selected_map, maptype):
     suffix = f"_{maptype}" if maptype else ""
-    csv_path = CSV_DIR / f"map_{selected_map}{suffix}_normalized_grid_counts.csv"
+    csv_path = CSV_DIR / f"map_{selected_map}{suffix}_grid_counts.csv"
     if not csv_path.exists():
         raise FileNotFoundError(
             f"No grid_counts CSV for map {selected_map} maptype={maptype!r} at {csv_path}"

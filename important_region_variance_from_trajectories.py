@@ -2,7 +2,11 @@
 Reconstructs, from already-saved executed_trajectory.csv files under
 results_hpc/planner_outputs, how much variance each planner removed
 specifically within "important" regions - grid cells whose GROUND TRUTH
-value is > 0.5 - as opposed to variance removed over the whole map.
+value is on the important side of GROUND_TRUTH_THRESHOLD (below it under
+LCB/NAIP, above it under UCB/grf - see gaussianprocesstraining.LCB) - as
+opposed to variance removed over the whole map. MAPTYPE/GROUND_TRUTH_THRESHOLD
+are env-configurable (default grf/0.5) so this doesn't need hand-editing every
+time the map type switches.
 
 Why this is possible without re-running anything: the Kalman/GP covariance
 update (kalman_update / covariance_after_sensor in gaussianprocesstraining.py)
@@ -39,17 +43,19 @@ from gaussianprocesstraining import (
     build_sensor_matrix,
     compress_shared_sensor_rows,
     measurement_noise_covariance,
+    LCB,
 )
 
 PLANNER_OUTPUTS_ROOT = Path(r"C:\Users\Aksha\OneDrive\Year 6\results_hpc\planner_outputs")
 CSV_DIR = SCRIPT_DIR / "csv"
 OUT_DIR = PLANNER_OUTPUTS_ROOT / "aggregate_plots" / "important_region_variance"
-GROUND_TRUTH_THRESHOLD = 0.5
+MAPTYPE = os.environ.get("MAPTYPE", "grf")
+GROUND_TRUTH_THRESHOLD = float(os.environ.get("UTILITY_THRESHOLD", "0.5"))
 COARSEN_FACTOR = 2  # 2m -> 4m analysis grid
 ANGLE_OF_VIEW = 60.0
 
 DIR_PATTERN = re.compile(
-    r"^(?P<outprefix>[a-zA-Z_]+?)_map_grf_(?P<mapid>\d+)_viz_hpc_(?P<planner>[a-zA-Z]+)_"
+    r"^(?P<outprefix>[a-zA-Z_]+?)_map_" + re.escape(MAPTYPE) + r"_(?P<mapid>\d+)_viz_hpc_(?P<planner>[a-zA-Z]+)_"
     r"map\d+_repeat(?P<repeat>\d+)_seed(?P<seed>\d+)$"
 )
 
@@ -108,7 +114,7 @@ _MASK_CACHE = {}
 def _important_mask_for_map(map_id, coords_c):
     if map_id in _MASK_CACHE:
         return _MASK_CACHE[map_id]
-    gt_path = CSV_DIR / f"map_{map_id}_grf_grid_counts.csv"
+    gt_path = CSV_DIR / f"map_{map_id}_{MAPTYPE}_grid_counts.csv"
     data = np.loadtxt(gt_path, delimiter=",", skiprows=1)
     gx, gy, gval = data[:, 0], data[:, 1], data[:, 2]
     n = coords_c.shape[0]
@@ -117,7 +123,10 @@ def _important_mask_for_map(map_id, coords_c):
         idx = np.where(np.isclose(gx, cx) & np.isclose(gy, cy))[0]
         if idx.size > 0:
             values[i] = gval[idx[0]]
-    mask = values > GROUND_TRUTH_THRESHOLD
+    if LCB:
+        mask = values <= GROUND_TRUTH_THRESHOLD  # LCB/NAIP: "important" = at/below threshold
+    else:
+        mask = values >= GROUND_TRUTH_THRESHOLD  # UCB/grf: "important" = at/above threshold
     _MASK_CACHE[map_id] = (mask, values)
     return mask, values
 

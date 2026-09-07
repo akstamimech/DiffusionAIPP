@@ -43,7 +43,7 @@ PYTHON = sys.executable
 
 EXECUTION_CHUNK_VALUES = [5, 10, 15, 20, 25, 30]
 MAP_ID = 44
-MAPTYPE = "NAIP"
+MAPTYPE = "grf"
 
 PLANNERS = {
     "Diffusion": {
