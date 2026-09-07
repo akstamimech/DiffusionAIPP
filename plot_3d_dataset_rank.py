@@ -7,16 +7,16 @@ from matplotlib import cm, colors
 
 
 # DATASET_PATH = Path(__file__).resolve().parent / "parallel_randomstart_dataset.pt"
-DATASET_PATH = Path(__file__).resolve().parent / "CMAES_beamsearch_dataset_3d_synthetic_final.pt"
+DATASET_PATH = Path(__file__).resolve().parent / "FINAL_NAIP_DATASET.pt"
 
 # (map_id, start_index, timestep) together identify one decision point ("node")
 # along one of DataCollector_3D_randomstart_multimodal.py's STARTS_PER_MAP=3
 # parallel chains. Usually one row is recorded there (the winning branch); when
 # alternate near-tied branches were also kept, multiple rows share the same
 # node - those are what this script visualizes as candidate modes.
-SELECTED_MAP = 22
-SELECTED_START_INDEX = 0  # which of the 3 parallel chains (0, 1, 2)
-SELECTED_ROUND = 6  # position along that chain (dataset's "timestep" field)
+SELECTED_MAP = 10
+SELECTED_START_INDEX = 3  # which of the 3 parallel chains (0, 1, 2)
+SELECTED_ROUND = 3 # position along that chain (dataset's "timestep" field)
 TOP_N = 4  # BRANCH_COUNT during collection was 4, so a node never has more candidates than this
 
 REQUIRED_KEYS = {
