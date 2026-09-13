@@ -122,7 +122,4 @@ python threeDSparseTransDiffusion.py
 
 ## Status
 
-Active thesis research code. Settings drift between sessions (map type, checkpoint paths, and several
-interacting constants get changed outside of any single work session), so the `CARRYOVER_*.md` files at
-the repo root are the authoritative, dated record of what was last verified working and what's still an
-open question. When in doubt about current defaults, read the script, not this README.
+Active thesis research code. Currently In progress!
