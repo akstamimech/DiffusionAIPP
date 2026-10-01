@@ -410,7 +410,7 @@ def main():
         plt.figure()
         plt.plot(eval_epochs, eval_variance_drops, marker="o", color="tab:green", label="Important-area variance drop")
         plt.xlabel("Epoch")
-        plt.ylabel(f"Variance drop in cells > {trainmod.EVAL_UTILITY_THRESHOLD} (initial - final)")
+        plt.ylabel(f"Variance drop in cells <= {trainmod.EVAL_UTILITY_THRESHOLD} (initial - final)")
         plt.title(f"Periodic single-map eval - Important-area variance drop (map {eval_map})")
         plt.legend()
         variance_drop_plot_path = trainmod.PLOT_DIR / "periodic_eval_variance_drop.png"

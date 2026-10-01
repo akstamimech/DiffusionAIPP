@@ -26,7 +26,7 @@ step = 2.0
 timealloted = int(os.environ.get("TIMEALLOTED", "300"))
 beta = float(os.environ.get("BETA", "1"))
 alpha = 0.02
-utility_threshold = float(os.environ.get("UTILITY_THRESHOLD", "0.5"))
+utility_threshold = float(os.environ.get("UTILITY_THRESHOLD", "0.3"))
 planning_horizon = int(os.environ.get("PLANNING_HORIZON", "8"))
 #multiblob map 20 is nice!
 selected_map = int(os.environ.get("SELECTED_MAP", 11))
@@ -34,7 +34,7 @@ samples_per_segment = 5
 execution_chunk = int(os.environ.get("EXECUTION_CHUNK", "40"))
 SENSORNOISE_SEED = int(os.environ.get("SENSORNOISE_SEED", "123"))
 
-MAPTYPE = os.environ.get("MAPTYPE", "halffield")
+MAPTYPE = os.environ.get("MAPTYPE", "NAIP")
 cma_seed = int(os.environ.get("CMA_SEED", "55"))
 CMAES_REFINE = os.environ.get("CMAES_REFINE", "1") != "0"  # False -> skip the CMA-ES
                                  # refinement step entirely and execute the grid
@@ -294,8 +294,8 @@ if __name__ == "__main__":
 
     rng = np.random.default_rng(SENSORNOISE_SEED + selected_map)
 
-    # Under GRF/UCB, the optimistic prior starts above the importance threshold.
-    mean = np.full(X_test.shape[0], utility_threshold + 0.1)
+    # Under LCB/NAIP, the pessimistic prior starts below the importance threshold.
+    mean = np.full(X_test.shape[0], utility_threshold - 0.1)
     mu = mean.copy()
     P = cov.copy()
     R = noise_model(INIT_ALTITUDE)   # measurement noise variance based on altitude

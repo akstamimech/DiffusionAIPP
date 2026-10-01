@@ -40,7 +40,7 @@ LOG_DIR.mkdir(exist_ok=True)
 SUMMARY_CSV = SCRIPT_DIR / "rerun_failed_80pct_checkpoints_summary.csv"
 
 SELECTED_MAP = 59
-MAPTYPE = "grf"
+MAPTYPE = "NAIP"
 EXTENDED_WALLCLOCK = 400.0
 THRESHOLD = 0.20  # <=20% remaining = 80% reduction
 MAX_WORKERS = 4

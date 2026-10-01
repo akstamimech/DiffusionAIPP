@@ -47,11 +47,11 @@ from evalmetrics import compute_reconstruction_rmse, compute_variance_time_metri
 from CMAES_classic_singlemap import compute_fov, dynamics_3d, waypoint_3d
 
 EVAL_EVERY = int(os.environ.get("EVAL_EVERY", 10))
-EVAL_MAPTYPE = os.environ.get("EVAL_MAPTYPE", "grf")
+EVAL_MAPTYPE = os.environ.get("EVAL_MAPTYPE", "NAIP")
 EVAL_MAP_OVERRIDE = os.environ.get("EVAL_MAP")  # None -> resolved to a held-out val map_id
 EVAL_TIMEALLOTED = 150
 EVAL_EXECUTION_CHUNK = 40
-EVAL_UTILITY_THRESHOLD = 0.5
+EVAL_UTILITY_THRESHOLD = 0.3
 EVAL_ANGLE_OF_VIEW = 60.0
 EVAL_INIT_ALTITUDE = 10.0
 EVAL_SENSORNOISE_SEED = 123
@@ -1232,14 +1232,14 @@ def run_single_map_eval(model, eval_env, timealloted=EVAL_TIMEALLOTED):
 
     rng = np.random.default_rng(EVAL_SENSORNOISE_SEED + eval_env["selected_map"])
 
-    mu = np.full(eval_env["X_test"].shape[0], EVAL_UTILITY_THRESHOLD + 0.1)
+    mu = np.full(eval_env["X_test"].shape[0], EVAL_UTILITY_THRESHOLD - 0.1)
     P = cov.copy()
-    # Ground-truth "important" cells (value > EVAL_UTILITY_THRESHOLD, GRF/UCB
+    # Ground-truth "important" cells (value <= EVAL_UTILITY_THRESHOLD, LCB/NAIP
     # convention), not the planner's own belief-based importance_filter -
     # true_map_flat is already aligned to X_test's exact ordering (see
     # build_true_map_flat), so this mask indexes np.diag(P) directly, same
     # convention as important_region_variance_from_trajectories.py.
-    important_mask = true_map_flat > EVAL_UTILITY_THRESHOLD
+    important_mask = true_map_flat <= EVAL_UTILITY_THRESHOLD
     initial_total_variance = float(np.sum(np.diag(P)[important_mask]))
     # Occupied-region variance sampled once per simulation timestep (including
     # this pre-flight value at ts=0), integrated below via trapz with unit
@@ -1653,7 +1653,7 @@ def train(
         plt.figure()
         plt.plot(eval_epochs, eval_occupied_variance_aucs, marker="o", color="tab:green", label="Occupied-area variance AUC")
         plt.xlabel("Epoch")
-        plt.ylabel(f"Variance AUC in cells > {EVAL_UTILITY_THRESHOLD} (integral over timesteps, not normalized)")
+        plt.ylabel(f"Variance AUC in cells <= {EVAL_UTILITY_THRESHOLD} (integral over timesteps, not normalized)")
         plt.title(f"Periodic single-map eval - Occupied-area variance AUC (map {eval_map_id})")
         plt.legend()
         variance_drop_plot_path = PLOT_DIR / "periodic_eval_variance_drop.png"

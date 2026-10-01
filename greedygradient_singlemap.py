@@ -29,10 +29,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 step = 2.0
 timealloted = int(os.environ.get("TIMEALLOTED", "3000"))
 beta = 1.0
-utility_threshold = float(os.environ.get("UTILITY_THRESHOLD", "0.5"))
+utility_threshold = float(os.environ.get("UTILITY_THRESHOLD", "0.3"))
 selected_map = int(os.environ.get("SELECTED_MAP", 53))
 SENSORNOISE_SEED = int(os.environ.get("SENSORNOISE_SEED", "123"))
-MAPTYPE = os.environ.get("MAPTYPE", "grf")  # "multiblob" or "NAIP"
+MAPTYPE = os.environ.get("MAPTYPE", "NAIP")  # "multiblob" or "NAIP"
 WALLCLOCK_SECONDS = float(os.environ.get("WALLCLOCK_SECONDS", "300"))  # <=0 = unconstrained (timestep
                                                                       # loop runs to completion); otherwise
                                                                       # the flight ends at timealloted
@@ -221,8 +221,8 @@ if __name__ == "__main__":
 
     rng = np.random.default_rng(SENSORNOISE_SEED + selected_map)
 
-    mean = np.full(X_test.shape[0], utility_threshold + 0.1) #UCB variant (grf)
-    # mean = np.full(X_test.shape[0], utility_threshold - 0.1) #pessimistic prior for LCB/NAIP: everywhere starts important
+    # mean = np.full(X_test.shape[0], utility_threshold + 0.1) #UCB variant (grf)
+    mean = np.full(X_test.shape[0], utility_threshold - 0.1) #pessimistic prior for LCB/NAIP: everywhere starts important
     mu = mean.copy()
     P = cov.copy()
 

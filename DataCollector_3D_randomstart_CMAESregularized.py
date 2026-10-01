@@ -43,6 +43,7 @@ from gaussianprocesstraining import (
     CMA_STEP_SIZE_XY,
     CMA_STEP_SIZE_Z,
     fov_grid_points,
+    fov_lateral_radius,
     flatten_waypoints_3d,
     future_sensor_model_3d,
     importance_filter,
@@ -103,10 +104,10 @@ except ImportError:
 #     independent plan+refine+execute passes instead of one.
 
 step = 2.0
-RANKLIM = 2
+RANKLIM = 6
 BETA = 1.0
 alpha = 0.02
-utility_threshold = 0.5
+utility_threshold = 0.3  # NAIP (LCB); the GRF/UCB value was 0.5
 planning_horizon = 8
 initial_map = 0
 mapcount = 60
@@ -122,26 +123,31 @@ samples_per_segment = 5
 EXECUTION_CHUNK_SCORING = 40
 EXECUTION_CHUNK_UPDATING = 20
 SENSORNOISE_SEED = 123
-MAPTYPE = "grf"
+MAPTYPE = "NAIP"
 INIT_ALTITUDE = 10.0
 ZMIN = 10.0
 ZMAX = 40.0
 ANGLE_OF_VIEW = 60.0
 
-# GRF-era kernel scale, matches gaussianprocesstraining.py's initialize_gp() defaults.
-# (NAIP-fitted values were sigma2=0.0079, lengthscale=4.78 - narrower real value range;
-# see git history / carryover docs if switching back to NAIP.)
-GP_KERNEL_SIGMA2 = 0.05
-GP_KERNEL_LENGTHSCALE = 6.08
+# NAIP-fitted kernel scale (median signal variance and GP-fitted lengthscale
+# over the non-degenerate NAIP maps, see
+# CARRYOVER_NAIP_NORMALIZATION_BUG_AND_MULTIMODAL_INVESTIGATION.md section 2).
+# initialize_gp()'s own defaults must match these for the planners to see the
+# same prior as the data collector. GRF-era values were sigma2=0.05,
+# lengthscale=6.08.
+GP_KERNEL_SIGMA2 = 0.0079
+GP_KERNEL_LENGTHSCALE = 4.78
 
 # --- multimodal branching configuration ---
 BRANCH_COUNT = 1  # how many of grid_search_3d's top first-step candidates to
                    # expand into full plans each round
-NEIGHBOURHOOD_THRESHOLD = 0.94  # a branch is kept (recorded) if its real
+NEIGHBOURHOOD_THRESHOLD = 0.98  # a branch is kept (recorded) if its real
                                  # achieved variance_correction (masked-trace
                                  # reduction in P, NOT RMSE against the true
                                  # map - see header) is at least this fraction
-                                 # of the best branch's
+                                 # of the best branch's. Tight on purpose, so
+                                 # that every kept alternative is a genuine
+                                 # mode achieving the same thing as the winner.
 PARALLEL_BRANCHES = False  # True -> each rank evaluates its BRANCH_COUNT branches
                            # concurrently via a local process pool (one pool per
                            # rank, created once in main() and reused for every
@@ -160,12 +166,24 @@ PARALLEL_BRANCHES = False  # True -> each rank evaluates its BRANCH_COUNT branch
 # For each grid-search warm start, collect the normal CMA-ES refinement plus
 # additional CMA-ES refinements. Each additional pass uses the same
 # information-gain objective but penalizes paths whose spline stays within this
-# RMS xy distance of any earlier optimum from the same branch-local solution
-# set. This is local to this data collector so deployment/shared planners keep
+# RMS xyz distance of any earlier optimum from the same branch-local solution
+# set (altitude included, weighted by CMA_DIVERSITY_Z_WEIGHT; distances are in
+# metres, so a weight of 1.0 counts a metre of altitude like a metre of xy).
+# This is local to this data collector so deployment/shared planners keep
 # their original single-objective CMA-ES behavior.
-CMA_SOLUTIONS_PER_BRANCH = 4
-CMA_DIVERSITY_DISTANCE_THRESHOLD = 20.0
+CMA_SOLUTIONS_PER_BRANCH = 8
+CMA_DIVERSITY_DISTANCE_THRESHOLD = float(os.environ.get("CMA_DIVERSITY_DISTANCE_THRESHOLD", "30.0"))
 CMA_DIVERSITY_PENALTY_WEIGHT = 1.0
+CMA_DIVERSITY_Z_WEIGHT = float(os.environ.get("CMA_DIVERSITY_Z_WEIGHT", "1.0"))
+
+# --- Jaccard distinctness filter ---
+# After the variance-based neighbourhood cut, a kept alternative is only
+# recorded if the set of important cells its path observes differs from the
+# set observed by every already-recorded path by at least this Jaccard
+# distance (0 = identical footprints, 1 = disjoint). The winner is always kept.
+# This is the hard guarantee that retained solutions are distinct modes, since
+# the CMA-ES penalty above is only a soft nudge.
+JACCARD_MIN_DISTANCE = float(os.environ.get("JACCARD_MIN_DISTANCE", "0.5"))
 
 # --- random-start configuration ---
 STARTS_PER_MAP = 4
@@ -546,10 +564,64 @@ def real_receding_horizon_planner(
     )
 
 
-def trajectory_xy_mse(path_a, path_b, target_len=target_trajectory_len):
+def trajectory_sq_distance(path_a, path_b, target_len=target_trajectory_len):
+    """Mean squared per-point distance (m^2) between two resampled 3D paths,
+    altitude included and scaled by CMA_DIVERSITY_Z_WEIGHT."""
     a = resample_trajectory(path_a, target_len)
     b = resample_trajectory(path_b, target_len)
-    return float(np.mean((a[:, :2] - b[:, :2]) ** 2))
+    diff = a - b
+    diff[:, 2] *= CMA_DIVERSITY_Z_WEIGHT
+    return float(np.mean(np.sum(diff ** 2, axis=1)))
+
+
+def path_footprint(spline_path, xs, ys, important_mask):
+    """Boolean flat mask of the important cells a path observes: the union of
+    the FOVs along the points that scoring actually flies
+    (EXECUTION_CHUNK_SCORING). Belief-only, no ground truth involved."""
+    xs = np.asarray(xs)
+    ys = np.asarray(ys)
+    nx = len(xs)
+    footprint = np.zeros(nx * len(ys), dtype=bool)
+    for px, py, pz in spline_path[:EXECUTION_CHUNK_SCORING]:
+        radius = fov_lateral_radius(pz, ANGLE_OF_VIEW)
+        x_idx = np.flatnonzero((xs >= px - radius) & (xs <= px + radius))
+        y_idx = np.flatnonzero((ys >= py - radius) & (ys <= py + radius))
+        footprint[(y_idx[:, None] * nx + x_idx[None, :]).ravel()] = True
+    return footprint & np.asarray(important_mask, dtype=bool)
+
+
+def jaccard_distance(a, b):
+    union = np.count_nonzero(a | b)
+    if union == 0:
+        return 0.0
+    return 1.0 - np.count_nonzero(a & b) / union
+
+
+def select_distinct_modes(branch_results, kept_indices, winner_idx, important_mask, xs, ys):
+    """Winner first, then the remaining near-optimal candidates in descending
+    variance_correction order, each kept only if its Jaccard distance to every
+    already-kept footprint is at least JACCARD_MIN_DISTANCE."""
+    footprints = {
+        winner_idx: path_footprint(
+            branch_results[winner_idx]["spline_path"], xs, ys, important_mask
+        )
+    }
+    distinct = [winner_idx]
+    others = sorted(
+        (i for i in kept_indices if i != winner_idx),
+        key=lambda i: -branch_results[i]["variance_correction"],
+    )
+    for i in others:
+        footprint = path_footprint(
+            branch_results[i]["spline_path"], xs, ys, important_mask
+        )
+        if all(
+            jaccard_distance(footprint, footprints[j]) >= JACCARD_MIN_DISTANCE
+            for j in distinct
+        ):
+            footprints[i] = footprint
+            distinct.append(i)
+    return distinct
 
 
 def diversity_regularized_objective_3d(
@@ -600,7 +672,7 @@ def diversity_regularized_objective_3d(
     )
     if reference_paths:
         min_mse = min(
-            trajectory_xy_mse(candidate_path, reference_path)
+            trajectory_sq_distance(candidate_path, reference_path)
             for reference_path in reference_paths
         )
     else:
@@ -1177,7 +1249,7 @@ def run_chain_and_record(
     rank_limit=None,
     pool=None,
 ):
-    mean = np.full(X_test.shape[0], utility_threshold + 0.1, dtype=float) #optimistic prior for UCB/grf: everywhere starts unimportant
+    mean = np.full(X_test.shape[0], utility_threshold - 0.1, dtype=float) #pessimistic prior for LCB/NAIP: everywhere starts important
     mu = mean.copy()
     P = cov.copy()
     cx, cy, cz = start_cx, start_cy, INIT_ALTITUDE
@@ -1341,10 +1413,12 @@ def run_chain_and_record(
 
         # winner is always parent_beam_index 0; other CMA-ES variants are only
         # recorded if their realized masked-variance reduction is within the
-        # neighbourhood threshold of the best solution for this round.
-        ordered_kept = [winner_idx] + [
-            i for i in kept_indices if i != winner_idx
-        ]
+        # neighbourhood threshold of the best solution for this round AND the
+        # important-cell footprint they observe is Jaccard-distinct from every
+        # already-recorded one.
+        ordered_kept = select_distinct_modes(
+            branch_results, kept_indices, winner_idx, importance_mask, xs, ys
+        )
         group_id = condition_id_for(selected_map, start_index, round_idx)
 
         for parent_beam_index, branch_i in enumerate(ordered_kept):
@@ -1370,9 +1444,10 @@ def run_chain_and_record(
             f"{baseline_variance - winner['variance_correction']:.4f} "
             f"(reduction={winner['variance_correction']:.4f}), global RMSE "
             f"{baseline_rmse:.4f} -> {winner['global_rmse']:.4f} "
-            f"({len(ordered_kept)}/{len(branch_results)} CMA-ES variants kept "
-            f"within {int(NEIGHBOURHOOD_THRESHOLD * 100)}% of best masked "
-            f"variance reduction)"
+            f"({len(ordered_kept)}/{len(branch_results)} CMA-ES variants kept: "
+            f"{len(kept_indices)} within {round(NEIGHBOURHOOD_THRESHOLD * 100)}% of best "
+            f"masked variance reduction, {len(ordered_kept)} after Jaccard "
+            f">= {JACCARD_MIN_DISTANCE})"
         )
 
         cx, cy, cz = winner["update_cx"], winner["update_cy"], winner["update_cz"]

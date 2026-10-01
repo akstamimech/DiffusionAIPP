@@ -13,10 +13,10 @@ import numpy as np
 SCRIPT_DIR = Path(__file__).resolve().parent
 VIZ_DIR = SCRIPT_DIR / "Vizualization"
 DEFAULT_MAPS = [50, 51, 52, 53, 54]
-MAPTYPE = "grf"
+MAPTYPE = "NAIP"
 TIMEALLOTED = 3000
 WALLCLOCK_SECONDS = 300
-UTILITY_THRESHOLD = 0.5
+UTILITY_THRESHOLD = 0.3
 RUN_TAG = "mission300_steps3000_avg5"
 INITIAL_VARIANCE = 130.05
 

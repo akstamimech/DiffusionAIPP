@@ -87,7 +87,7 @@ def make_comparison_plot(map_id, diffusion_data, imitation_data, output_dir, uti
     axes[-1].set_xlabel("Simulation timestep")
     axes[0].legend(loc="best")
     fig.suptitle(
-        f"Map {map_id} GRF: Diffusion vs ImitateTrans (utility threshold {utility_threshold:g})",
+        f"Map {map_id} NAIP: Diffusion vs ImitateTrans (utility threshold {utility_threshold:g})",
         fontsize=14,
     )
     fig.tight_layout(rect=[0, 0, 1, 0.97])
@@ -138,7 +138,7 @@ def compare_map(map_id, args):
 
     diffusion_data = read_trace(diffusion_named_csv)
     imitation_data = read_trace(imitation_named_csv)
-    comparison_dir = VIZ_DIR / "diffusion_vs_imitation_grf_comparison"
+    comparison_dir = VIZ_DIR / "diffusion_vs_imitation_naip_comparison"
     plot_path = make_comparison_plot(
         map_id,
         diffusion_data,
@@ -187,10 +187,10 @@ def write_summary(rows, output_path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--maps", type=int, nargs="+", default=list(range(50, 56)))
-    parser.add_argument("--maptype", default="grf")
+    parser.add_argument("--maptype", default="NAIP")
     parser.add_argument("--eta", type=float, default=1.0)
     parser.add_argument("--execution-chunk", type=int, default=20)
-    parser.add_argument("--utility-threshold", type=float, default=0.5)
+    parser.add_argument("--utility-threshold", type=float, default=0.3)
     parser.add_argument("--wallclock-seconds", type=float, default=0.0)
     parser.add_argument("--timealloted", type=int, default=300)
     parser.add_argument("--sensornoise-seed", type=int, default=123)
@@ -201,7 +201,7 @@ def main():
     rows = [compare_map(map_id, args) for map_id in args.maps]
     summary_path = (
         VIZ_DIR
-        / "diffusion_vs_imitation_grf_comparison"
+        / "diffusion_vs_imitation_naip_comparison"
         / f"maps_{min(args.maps)}_{max(args.maps)}_threshold_{threshold_tag(args.utility_threshold)}_comparison_summary.csv"
     )
     write_summary(rows, summary_path)

@@ -63,7 +63,7 @@ BLAS_THREAD_ENV = {
 }
 _write_lock = threading.Lock()
 
-MAPTYPE = os.environ.get("MAPTYPE", "grf")
+MAPTYPE = os.environ.get("MAPTYPE", "NAIP")
 SELECTED_MAP = int(os.environ.get("SELECTED_MAP", 59))
 
 

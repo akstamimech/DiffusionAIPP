@@ -7,7 +7,7 @@ belonging to one specific planner.
 """
 import os
 
-os.environ.setdefault("MAPTYPE", "grf")
+os.environ.setdefault("MAPTYPE", "NAIP")
 os.environ.setdefault("SELECTED_MAP", "51")
 
 from pathlib import Path
@@ -27,7 +27,7 @@ OUT_PNG = SCRIPT_DIR / "simulation_start_frame_map51_grf.png"
 
 def main():
     gp, X_test, mean, cov, xs, ys, X, Y, xmin, xmax, ymin, ymax, step = initialize_gp()
-    mu = np.full(X_test.shape[0], sim.utility_threshold + 0.1)
+    mu = np.full(X_test.shape[0], sim.utility_threshold - 0.1)
 
     cx, cy, cz = 4.0, 4.0, sim.INIT_ALTITUDE
     ny, nx = len(ys), len(xs)

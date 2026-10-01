@@ -19,7 +19,7 @@ name. This animation uses eta=0 to match what the real planner actually runs by 
 import os
 
 os.environ.setdefault("SELECTED_MAP", "51")
-os.environ.setdefault("MAPTYPE", "grf")
+os.environ.setdefault("MAPTYPE", "NAIP")
 
 from pathlib import Path
 
@@ -64,7 +64,7 @@ def build_conditioning():
         delimiter=",", skiprows=1,
     )
     _, X_test, mean, cov, xs, ys, X, Y, xmin, xmax, ymin, ymax, step = dp.initialize_gp()
-    mean = np.full(X_test.shape[0], dp.utility_threshold + 0.1)
+    mean = np.full(X_test.shape[0], dp.utility_threshold - 0.1)
 
     current_position = (dp.START_X, dp.START_Y, dp.INIT_ALTITUDE)
     current_position_world = torch.as_tensor(current_position, dtype=torch.float32, device=diffusion.device).view(1, 3)

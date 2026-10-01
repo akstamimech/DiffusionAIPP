@@ -163,7 +163,7 @@ def _write_summary(planner, rows, task_id=None):
 def _run_one(config, map_id, repeat):
     seed = _seed_for(map_id, repeat)
     run_tag = f"hpc_{config.planner}_map{map_id}_repeat{repeat}_seed{seed}"
-    maptype = os.environ.get("MAPTYPE", "grf")
+    maptype = os.environ.get("MAPTYPE", "NAIP")
     output_dir = PLANNER_OUTPUT_ROOT / f"{config.output_prefix}_map_{maptype}_{map_id}_viz_{run_tag}"
     log_path = LOG_ROOT / f"{config.planner}_map{map_id}_repeat{repeat}_seed{seed}.log"
     LOG_ROOT.mkdir(parents=True, exist_ok=True)
@@ -173,10 +173,10 @@ def _run_one(config, map_id, repeat):
     env.update(
         {
             "SELECTED_MAP": str(map_id),
-            "MAPTYPE": os.environ.get("MAPTYPE", "grf"),
+            "MAPTYPE": os.environ.get("MAPTYPE", "NAIP"),
             "TIMEALLOTED": os.environ.get("TIMEALLOTED", "3000"),
             "WALLCLOCK_SECONDS": os.environ.get("WALLCLOCK_SECONDS", "300"),
-            "UTILITY_THRESHOLD": os.environ.get("UTILITY_THRESHOLD", "0.5"),
+            "UTILITY_THRESHOLD": os.environ.get("UTILITY_THRESHOLD", "0.3"),
             "PLANNING_HORIZON": os.environ.get("PLANNING_HORIZON", "8"),
             "EXECUTION_CHUNK": os.environ.get("EXECUTION_CHUNK", "40"),
             "SENSORNOISE_SEED": str(seed),

@@ -42,13 +42,13 @@ step = 2.0
 timealloted = int(os.environ.get("TIMEALLOTED", "4000"))
 beta = 1.0
 alpha = 0.02
-utility_threshold = float(os.environ.get("UTILITY_THRESHOLD", "0.5"))
+utility_threshold = float(os.environ.get("UTILITY_THRESHOLD", "0.3"))
 planning_horizon = int(os.environ.get("PLANNING_HORIZON", "8"))
 selected_map = int(os.environ.get("SELECTED_MAP", 55))
 samples_per_segment = 5
 execution_chunk = int(os.environ.get("EXECUTION_CHUNK", 40))
 SENSORNOISE_SEED = int(os.environ.get("SENSORNOISE_SEED", "123"))
-MAPTYPE = os.environ.get("MAPTYPE", "grf")
+MAPTYPE = os.environ.get("MAPTYPE", "NAIP")
 CHUNK_SIZE = 256
 CHUNK_PREFIX = "./trajectory_dataset_chunk"
 ETA = float(os.environ.get("ETA", "0.0"))
@@ -368,8 +368,8 @@ if __name__ == "__main__":
 
     rng = np.random.default_rng(SENSORNOISE_SEED + selected_map)
 
-    # Under GRF/UCB, the optimistic prior starts above the importance threshold.
-    mean = np.full(X_test.shape[0], utility_threshold + 0.1)
+    # Under LCB/NAIP, the pessimistic prior starts below the importance threshold.
+    mean = np.full(X_test.shape[0], utility_threshold - 0.1)
     mu = mean.copy()
     P = cov.copy()
 

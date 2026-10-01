@@ -66,7 +66,7 @@ def main():
     true_map_flat = build_true_map_flat(pts, X_test)
 
     rng = np.random.default_rng(sim.SENSORNOISE_SEED + sim.selected_map)
-    mean = np.full(X_test.shape[0], sim.utility_threshold + 0.1)
+    mean = np.full(X_test.shape[0], sim.utility_threshold - 0.1)
     mu = mean.copy()
     P = cov.copy()
 

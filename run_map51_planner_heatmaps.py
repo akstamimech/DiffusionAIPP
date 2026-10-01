@@ -612,14 +612,14 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--map-id", type=int, default=51)
     parser.add_argument("--maps", type=int, nargs="+")
-    parser.add_argument("--maptype", default="grf")
+    parser.add_argument("--maptype", default="NAIP")
     parser.add_argument("--timealloted", type=int, default=3000)
     parser.add_argument("--wallclock-seconds", type=float, default=300.0)
     parser.add_argument("--execution-chunk", type=int, default=20)
-    parser.add_argument("--utility-threshold", type=float, default=0.5)
+    parser.add_argument("--utility-threshold", type=float, default=0.3)
     parser.add_argument("--sensornoise-seed", type=int, default=123)
     parser.add_argument("--run-tag", default="mission300_steps3000")
-    parser.add_argument("--important-threshold", type=float, default=0.5)
+    parser.add_argument("--important-threshold", type=float, default=0.3)
     parser.add_argument(
         "--skip-run",
         action="store_true",

@@ -33,7 +33,7 @@ def main():
         enumerate(dc.starts_for_map(SELECTED_MAP, xmin, xmax, ymin, ymax))
     )[0]
 
-    mean_field = np.full(X_test.shape[0], dc.utility_threshold + 0.1, dtype=float)
+    mean_field = np.full(X_test.shape[0], dc.utility_threshold - 0.1, dtype=float)
     mu = mean_field.copy()
     P = cov.copy()
     cx, cy, cz = start_cx, start_cy, dc.INIT_ALTITUDE

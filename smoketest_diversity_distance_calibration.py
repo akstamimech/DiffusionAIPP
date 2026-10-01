@@ -20,14 +20,12 @@ if str(script_dir) not in sys.path:
 import DataCollector_3D_randomstart_CMAESregularized as dc
 
 SELECTED_MAP = 91
-ROUNDS = 5
+ROUNDS = int(__import__("os").environ.get("SMOKETEST_ROUNDS", "5"))
 
 
 def pairwise_xyz_rms(path_a, path_b):
-    a = dc.resample_trajectory(path_a, dc.target_trajectory_len)
-    b = dc.resample_trajectory(path_b, dc.target_trajectory_len)
-    d2 = np.sum((a - b) ** 2, axis=1)  # squared euclidean per point, xyz
-    return float(np.sqrt(np.mean(d2)))  # RMS euclidean distance per point
+    # same distance the CMA-ES diversity penalty uses (xyz, z-weighted)
+    return float(np.sqrt(dc.trajectory_sq_distance(path_a, path_b)))
 
 
 def main():
@@ -40,7 +38,7 @@ def main():
         enumerate(dc.starts_for_map(SELECTED_MAP, xmin, xmax, ymin, ymax))
     )[0]
 
-    mean_field = np.full(X_test.shape[0], dc.utility_threshold + 0.1, dtype=float)
+    mean_field = np.full(X_test.shape[0], dc.utility_threshold - 0.1, dtype=float)
     mu = mean_field.copy()
     P = cov.copy()
     cx, cy, cz = start_cx, start_cy, dc.INIT_ALTITUDE
@@ -76,12 +74,27 @@ def main():
         paths = [r["spline_path"] for r in results]
         variants = [r["cma_variant"] for r in results]
 
-        print(f"round {round_idx}:")
+        utility = dc.importance_filter(mu, P, dc.BETA, threshold=dc.utility_threshold)
+        importance_mask = utility > 0
+        footprints = [dc.path_footprint(p, xs, ys, importance_mask) for p in paths]
+        baseline_var = float(np.sum(np.diag(P)[importance_mask]))
+        gains = [baseline_var - float(np.sum(np.diag(r["final_P"])[importance_mask])) for r in results]
+        best_gain = max(gains)
+
+        print(f"round {round_idx}: gains vs best = " + ", ".join(f"{g / best_gain:.3f}" for g in gains))
         for i in range(len(paths)):
             for j in range(i + 1, len(paths)):
                 rms = pairwise_xyz_rms(paths[i], paths[j])
+                jd = dc.jaccard_distance(footprints[i], footprints[j])
                 cleared = "CLEARS threshold (counts as diverse)" if rms > threshold_rms else "under threshold (penalized as too similar)"
-                print(f"  {variants[i]} vs {variants[j]}: RMS xyz distance = {rms:6.2f} m -> {cleared}")
+                print(f"  {variants[i]} vs {variants[j]}: RMS xyz = {rms:6.2f} m ({cleared}), Jaccard = {jd:.3f}")
+        winner_i = int(np.argmax(gains))
+        near_opt = [i for i, g in enumerate(gains) if i == winner_i or g / best_gain >= dc.NEIGHBOURHOOD_THRESHOLD]
+        kept = dc.select_distinct_modes(
+            [{"spline_path": p, "variance_correction": g} for p, g in zip(paths, gains)],
+            near_opt, winner_i, importance_mask, xs, ys,
+        )
+        print(f"  kept: {len(near_opt)} within {dc.NEIGHBOURHOOD_THRESHOLD:.0%} of best, {len(kept)} after Jaccard >= {dc.JACCARD_MIN_DISTANCE}")
 
         # advance using the variance-winner, same rule run_chain_and_record uses
         winner = max(results, key=lambda r: 0)  # placeholder, replaced below

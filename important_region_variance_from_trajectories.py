@@ -49,8 +49,8 @@ from gaussianprocesstraining import (
 PLANNER_OUTPUTS_ROOT = Path(r"C:\Users\Aksha\OneDrive\Year 6\results_hpc\planner_outputs")
 CSV_DIR = SCRIPT_DIR / "csv"
 OUT_DIR = PLANNER_OUTPUTS_ROOT / "aggregate_plots" / "important_region_variance"
-MAPTYPE = os.environ.get("MAPTYPE", "grf")
-GROUND_TRUTH_THRESHOLD = float(os.environ.get("UTILITY_THRESHOLD", "0.5"))
+MAPTYPE = os.environ.get("MAPTYPE", "NAIP")
+GROUND_TRUTH_THRESHOLD = float(os.environ.get("UTILITY_THRESHOLD", "0.3"))
 COARSEN_FACTOR = 2  # 2m -> 4m analysis grid
 ANGLE_OF_VIEW = 60.0
 

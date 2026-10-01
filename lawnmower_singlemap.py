@@ -22,13 +22,13 @@ timealloted = int(os.environ.get("TIMEALLOTED", "400"))
 #beta, alpha, are just for vizualisation. utility is for GP
 beta = 1.5
 alpha = 1.0
-utility_threshold = float(os.environ.get("UTILITY_THRESHOLD", "0.5"))
+utility_threshold = float(os.environ.get("UTILITY_THRESHOLD", "0.3"))
 planning_horizon = int(os.environ.get("PLANNING_HORIZON", "8"))
 action_horizon = 3  # this is more like replanning horizon
 selected_map = int(os.environ.get("SELECTED_MAP", 55))
 lateral_coverage = step * 2
 SENSORNOISE_SEED = int(os.environ.get("SENSORNOISE_SEED", "123"))
-MAPTYPE = os.environ.get("MAPTYPE", "halffield") #choose between "multiblob" and "halffield" or "blob" or "(nothing)" or "NAIP"
+MAPTYPE = os.environ.get("MAPTYPE", "NAIP") #choose between "multiblob" and "halffield" or "blob" or "(nothing)" or "NAIP"
 INIT_ALTITUDE = 10
 ZMIN = 10.0
 ZMAX = 40.0
@@ -176,7 +176,7 @@ if __name__ == "__main__":
 
     rng = np.random.default_rng(SENSORNOISE_SEED + selected_map)
 
-    mean = np.full(X_test.shape[0], utility_threshold + 0.1) #UCB/grf: optimistic prior, everywhere starts unimportant
+    mean = np.full(X_test.shape[0], utility_threshold - 0.1) #LCB/NAIP: pessimistic prior, everywhere starts unimportant
     mu = mean.copy()
     P = cov.copy()
     R = noise_model(INIT_ALTITUDE)

@@ -61,11 +61,11 @@ def save_position_heatmap_csv(path, xs, ys, heat):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--map-id", type=int, default=200)
-    parser.add_argument("--maptype", default="grf")
+    parser.add_argument("--maptype", default="NAIP")
     parser.add_argument("--timealloted", type=int, default=3000)
     parser.add_argument("--wallclock-seconds", type=float, default=300.0)
     parser.add_argument("--run-tag", default="corners_start5050")
-    parser.add_argument("--important-threshold", type=float, default=0.5)
+    parser.add_argument("--important-threshold", type=float, default=0.3)
     return parser.parse_args()
 
 

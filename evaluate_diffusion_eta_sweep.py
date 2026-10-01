@@ -110,7 +110,7 @@ def main():
         description="Run Diffusionplanner_singlemap.py repeatedly for ETA values and summarize variance-drop bands."
     )
     parser.add_argument("--selected-map", type=int, default=int(os.environ.get("SELECTED_MAP", "58")))
-    parser.add_argument("--maptype", default=os.environ.get("MAPTYPE", "grf"))
+    parser.add_argument("--maptype", default=os.environ.get("MAPTYPE", "NAIP"))
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--etas", type=float, nargs="+", default=[0.0, 1.0])
     parser.add_argument("--base-seed", type=int, default=17000)

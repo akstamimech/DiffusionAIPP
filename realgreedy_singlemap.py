@@ -26,7 +26,7 @@ step = 2.0
 timealloted = int(os.environ.get("TIMEALLOTED", "3000"))
 beta = 1
 alpha = 0.02
-utility_threshold = float(os.environ.get("UTILITY_THRESHOLD", "0.5"))
+utility_threshold = float(os.environ.get("UTILITY_THRESHOLD", "0.3"))
 planning_horizon = int(os.environ.get("PLANNING_HORIZON", "1"))
 #multiblob map 20 is nice!
 selected_map = int(os.environ.get("SELECTED_MAP", 41))
@@ -34,7 +34,7 @@ samples_per_segment = 5
 execution_chunk = int(os.environ.get("EXECUTION_CHUNK", "5"))
 SENSORNOISE_SEED = int(os.environ.get("SENSORNOISE_SEED", "123"))
 
-MAPTYPE = os.environ.get("MAPTYPE", "grf") #choose between "multiblob" and "halffield" or "blob" or "(nothing)" or "grf"
+MAPTYPE = os.environ.get("MAPTYPE", "NAIP") #choose between "multiblob" and "halffield" or "blob" or "(nothing)" or "grf"
 cma_seed = int(os.environ.get("CMA_SEED", "55"))
 USE_SOFTMAX_GRID_SEARCH = False  # False -> original deterministic grid_search_3d (argmax
                                  # every step, same warm start every replan). True ->
@@ -278,8 +278,8 @@ if __name__ == "__main__":
     rng = np.random.default_rng(SENSORNOISE_SEED + selected_map)
 
     # mu = mean.copy()
-    mean = np.full(X_test.shape[0], utility_threshold + 0.1) ##ATTEMPT - UCB variant (grf)
-    # mean = np.full(X_test.shape[0], utility_threshold - 0.1) ##ATTEMPT - pessimistic prior for LCB/NAIP
+    # mean = np.full(X_test.shape[0], utility_threshold + 0.1) ##ATTEMPT - UCB variant (grf)
+    mean = np.full(X_test.shape[0], utility_threshold - 0.1) ##ATTEMPT - pessimistic prior for LCB/NAIP
     mu = mean.copy()
     P = cov.copy()
     R = noise_model(INIT_ALTITUDE)   # measurement noise variance based on altitude

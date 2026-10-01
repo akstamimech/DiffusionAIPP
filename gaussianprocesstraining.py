@@ -68,7 +68,7 @@ GRID_SEARCH_TIEBREAK_SEED = None  # None -> draws from numpy's global RNG state;
                                    # set an int for reproducible tie-breaking.
 
 
-LCB = False  # GRF/UCB: cells are important when mu + beta*sigma reaches the threshold.
+LCB = True  # LCB/NAIP: cells are important when mu - beta*sigma stays at/below the threshold.
 
 COST_EXPONENT = float(os.environ.get("COST_EXPONENT", "1.0"))  # Exponent applied to the distance/cost denominator in the grid-search
                       # step score (gain / distance**COST_EXPONENT, see _grid_search_3d_impl)
@@ -1383,7 +1383,10 @@ def kalman_update(mu, P, sensor, z_meas, R, block_ids=None):
     return mu, P
 
 
-def initialize_gp(sigma2=0.05, lengthscale=6.08, xmin=0.0, xmax=100.0, ymin=0.0, ymax=100.0):
+# NAIP-fitted kernel scale (must match GP_KERNEL_SIGMA2/GP_KERNEL_LENGTHSCALE in the data
+# collector so planners see the same prior the training data was collected under).
+# GRF-era defaults were sigma2=0.05, lengthscale=6.08.
+def initialize_gp(sigma2=0.0079, lengthscale=4.78, xmin=0.0, xmax=100.0, ymin=0.0, ymax=100.0):
     kernel = ConstantKernel(
         sigma2, constant_value_bounds="fixed"
     ) * Matern(

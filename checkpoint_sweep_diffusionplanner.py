@@ -43,7 +43,7 @@ RUN_TAG_PREFIX = "ckpt_sweep"
 # MAPTYPE isn't overridden - left at whatever Diffusionplanner_singlemap.py currently
 # defaults to - but we need to know it to locate each run's output dir afterward, so it's
 # read the same way the target script itself reads it.
-MAPTYPE = os.environ.get("MAPTYPE", "grf")
+MAPTYPE = os.environ.get("MAPTYPE", "NAIP")
 # SELECTED_MAP is likewise left at the target script's own current default; queried once
 # via a throwaway subprocess isn't worth it, so this mirrors the script's own default
 # literal (checked directly in Diffusionplanner_singlemap.py's source before running this).

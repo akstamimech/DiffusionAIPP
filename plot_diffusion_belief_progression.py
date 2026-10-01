@@ -18,7 +18,7 @@ last run's cached snapshots (CACHE_PATH) - use this for any purely cosmetic plot
 import os
 
 os.environ.setdefault("SELECTED_MAP", "51")
-os.environ.setdefault("MAPTYPE", "grf")
+os.environ.setdefault("MAPTYPE", "NAIP")
 os.environ.setdefault("WALLCLOCK_SECONDS", "40")
 os.environ.setdefault("ENFORCE_MIN_STEP_TIME", "0")
 os.environ.setdefault("SKIP_VIZ", "1")
@@ -81,7 +81,7 @@ def run_simulation():
 
     rng = np.random.default_rng(dp.SENSORNOISE_SEED + dp.selected_map)
 
-    mean = np.full(X_test.shape[0], dp.utility_threshold + 0.1)
+    mean = np.full(X_test.shape[0], dp.utility_threshold - 0.1)
     mu = mean.copy()
     P = cov.copy()
 
