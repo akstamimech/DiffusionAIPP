@@ -104,7 +104,7 @@ except ImportError:
 #     independent plan+refine+execute passes instead of one.
 
 step = 2.0
-RANKLIM = 6
+RANKLIM = 16
 BETA = 1.0
 alpha = 0.02
 utility_threshold = 0.3  # NAIP (LCB); the GRF/UCB value was 0.5
@@ -141,13 +141,15 @@ GP_KERNEL_LENGTHSCALE = 4.78
 # --- multimodal branching configuration ---
 BRANCH_COUNT = 1  # how many of grid_search_3d's top first-step candidates to
                    # expand into full plans each round
-NEIGHBOURHOOD_THRESHOLD = 0.98  # a branch is kept (recorded) if its real
+NEIGHBOURHOOD_THRESHOLD = 0.95  # a branch is kept (recorded) if its real
                                  # achieved variance_correction (masked-trace
                                  # reduction in P, NOT RMSE against the true
                                  # map - see header) is at least this fraction
-                                 # of the best branch's. Tight on purpose, so
-                                 # that every kept alternative is a genuine
-                                 # mode achieving the same thing as the winner.
+                                 # of the best branch's. 0.95 keeps only
+                                 # candidates within 5% of the winner, so a kept
+                                 # alternative achieves essentially the same
+                                 # variance reduction; the Jaccard filter below
+                                 # then makes sure it is a distinct mode.
 PARALLEL_BRANCHES = False  # True -> each rank evaluates its BRANCH_COUNT branches
                            # concurrently via a local process pool (one pool per
                            # rank, created once in main() and reused for every
@@ -162,28 +164,28 @@ PARALLEL_BRANCHES = False  # True -> each rank evaluates its BRANCH_COUNT branch
                            # --cpus-per-task=BRANCH_COUNT) - otherwise there are no
                            # spare cores for the pool to use.
 
-# --- CMA-ES diversity regularization ---
-# For each grid-search warm start, collect the normal CMA-ES refinement plus
-# additional CMA-ES refinements. Each additional pass uses the same
-# information-gain objective but penalizes paths whose spline stays within this
-# RMS xyz distance of any earlier optimum from the same branch-local solution
-# set (altitude included, weighted by CMA_DIVERSITY_Z_WEIGHT; distances are in
-# metres, so a weight of 1.0 counts a metre of altitude like a metre of xy).
-# This is local to this data collector so deployment/shared planners keep
-# their original single-objective CMA-ES behavior.
+# --- CMA-ES solutions per round ---
+# Every round runs CMA_SOLUTIONS_PER_BRANCH independent, plain (unpenalized)
+# CMA-ES refinements from the same grid-search warm start. They differ only by
+# seed, so each lands in whatever basin its own random search finds. There is
+# deliberately NO diversity/distance term in the CMA-ES objective: distinctness
+# is enforced afterwards by the Jaccard filter below. The step size (20 m xy /
+# 8 m z) and population (12) come from gaussianprocesstraining.py; the number
+# of generations is set here for the collector only, so the live CMA-ES planner
+# used as an evaluation baseline keeps its own budget.
 CMA_SOLUTIONS_PER_BRANCH = 8
-CMA_DIVERSITY_DISTANCE_THRESHOLD = float(os.environ.get("CMA_DIVERSITY_DISTANCE_THRESHOLD", "30.0"))
-CMA_DIVERSITY_PENALTY_WEIGHT = 1.0
-CMA_DIVERSITY_Z_WEIGHT = float(os.environ.get("CMA_DIVERSITY_Z_WEIGHT", "1.0"))
+CMA_GENERATIONS = int(os.environ.get("CMA_GENERATIONS", "200"))
+CMA_MAXFEVALS = CMA_GENERATIONS * CMA_PREDICTIVE_POPSIZE * 2  # never the binding limit; maxiter (generations) is
 
 # --- Jaccard distinctness filter ---
 # After the variance-based neighbourhood cut, a kept alternative is only
 # recorded if the set of important cells its path observes differs from the
 # set observed by every already-recorded path by at least this Jaccard
 # distance (0 = identical footprints, 1 = disjoint). The winner is always kept.
-# This is the hard guarantee that retained solutions are distinct modes, since
-# the CMA-ES penalty above is only a soft nudge.
-JACCARD_MIN_DISTANCE = float(os.environ.get("JACCARD_MIN_DISTANCE", "0.5"))
+# This is the only mechanism that makes retained solutions distinct modes.
+# 0.3 rejects only near-duplicates (calibrated on NAIP map 5: about 2% of
+# candidate pairs fall below it; 0.5 rejected about 25%).
+JACCARD_MIN_DISTANCE = float(os.environ.get("JACCARD_MIN_DISTANCE", "0.3"))
 
 # --- random-start configuration ---
 STARTS_PER_MAP = 4
@@ -564,16 +566,6 @@ def real_receding_horizon_planner(
     )
 
 
-def trajectory_sq_distance(path_a, path_b, target_len=target_trajectory_len):
-    """Mean squared per-point distance (m^2) between two resampled 3D paths,
-    altitude included and scaled by CMA_DIVERSITY_Z_WEIGHT."""
-    a = resample_trajectory(path_a, target_len)
-    b = resample_trajectory(path_b, target_len)
-    diff = a - b
-    diff[:, 2] *= CMA_DIVERSITY_Z_WEIGHT
-    return float(np.mean(np.sum(diff ** 2, axis=1)))
-
-
 def path_footprint(spline_path, xs, ys, important_mask):
     """Boolean flat mask of the important cells a path observes: the union of
     the FOVs along the points that scoring actually flies
@@ -624,157 +616,6 @@ def select_distinct_modes(branch_results, kept_indices, winner_idx, important_ma
     return distinct
 
 
-def diversity_regularized_objective_3d(
-    values,
-    mu,
-    P,
-    xs,
-    ys,
-    start_x,
-    start_y,
-    start_z,
-    beta,
-    utility_threshold,
-    zmin,
-    zmax,
-    reference_paths,
-    cached_utility,
-    cached_importance_mask,
-):
-    objective = trajectory_objective_3d(
-        values,
-        mu,
-        P,
-        xs,
-        ys,
-        start_x,
-        start_y,
-        start_z,
-        beta,
-        utility_threshold,
-        zmin,
-        zmax,
-        predictive_variance=True,
-        cached_utility=cached_utility,
-        cached_importance_mask=cached_importance_mask,
-    )
-
-    raw_control_waypoints = unflatten_waypoints_3d(values)
-    control_waypoints = clip_waypoints_continuous_3d(
-        raw_control_waypoints, xs, ys, zmin, zmax
-    )
-    candidate_path = build_spline_trajectory_3d(
-        start_x,
-        start_y,
-        start_z,
-        control_waypoints,
-        samples_per_segment=samples_per_segment,
-    )
-    if reference_paths:
-        min_mse = min(
-            trajectory_sq_distance(candidate_path, reference_path)
-            for reference_path in reference_paths
-        )
-    else:
-        min_mse = float("inf")
-    mse_threshold = CMA_DIVERSITY_DISTANCE_THRESHOLD ** 2
-    closeness_penalty = (
-        CMA_DIVERSITY_PENALTY_WEIGHT * max(0.0, mse_threshold - min_mse)
-    )
-    return objective + closeness_penalty
-
-
-def cma_es_refine_waypoints_3d_diverse(
-    initial_waypoints,
-    mu,
-    P,
-    xs,
-    ys,
-    cx,
-    cy,
-    cz,
-    beta,
-    utility_threshold,
-    zmin,
-    zmax,
-    reference_paths,
-    seed,
-):
-    margin = step * 2
-    xmin, xmax = np.min(xs), np.max(xs)
-    ymin, ymax = np.min(ys), np.max(ys)
-    initial_waypoints = clip_waypoints_continuous_3d(
-        initial_waypoints,
-        xs,
-        ys,
-        zmin,
-        zmax,
-        margin=margin,
-    )
-    x0 = flatten_waypoints_3d(initial_waypoints)
-    sigma0 = 1.0
-    cma_stds = np.tile(
-        [CMA_STEP_SIZE_XY, CMA_STEP_SIZE_XY, CMA_STEP_SIZE_Z],
-        len(initial_waypoints),
-    )
-
-    lower_bounds = []
-    upper_bounds = []
-    for _ in initial_waypoints:
-        lower_bounds.extend([xmin + margin, ymin + margin, zmin])
-        upper_bounds.extend([xmax - margin, ymax - margin, zmax])
-
-    cached_utility = importance_filter(mu, P, beta, threshold=utility_threshold)
-    cached_importance_mask = cached_utility > 0
-    es = cma.CMAEvolutionStrategy(
-        x0,
-        sigma0,
-        {
-            "bounds": [lower_bounds, upper_bounds],
-            "maxiter": CMA_PREDICTIVE_MAXITER,
-            "popsize": CMA_PREDICTIVE_POPSIZE,
-            "maxfevals": CMA_PREDICTIVE_MAXFEVALS,
-            "seed": seed,
-            "verb_disp": 0,
-            "verb_log": 0,
-            "CMA_stds": cma_stds,
-        },
-    )
-
-    while not es.stop() and es.countevals < CMA_PREDICTIVE_MAXFEVALS:
-        solutions = es.ask()
-        values = [
-            diversity_regularized_objective_3d(
-                solution,
-                mu,
-                P,
-                xs,
-                ys,
-                cx,
-                cy,
-                cz,
-                beta,
-                utility_threshold,
-                zmin,
-                zmax,
-                reference_paths,
-                cached_utility,
-                cached_importance_mask,
-            )
-            for solution in solutions
-        ]
-        es.tell(solutions, values)
-
-    return clip_waypoints_continuous_3d(
-        unflatten_waypoints_3d(es.result.xbest),
-        xs,
-        ys,
-        zmin,
-        zmax,
-        margin=margin,
-    )
-
-
 def cma_es_refine_waypoint_variants(
     flight_plan_3d,
     mu,
@@ -786,37 +627,14 @@ def cma_es_refine_waypoint_variants(
     cz,
     beta,
     planner_seed,
-    regularized_seeds,
+    variant_seeds,
 ):
-    original_waypoints = cma_es_refine_waypoints_3d(
-        flight_plan_3d,
-        mu,
-        P,
-        xs,
-        ys,
-        cx,
-        cy,
-        cz,
-        beta,
-        utility_threshold,
-        ZMIN,
-        ZMAX,
-        predictive_variance=True,
-        seed=planner_seed,
-    )
-    original_path = build_spline_trajectory_3d(
-        cx,
-        cy,
-        cz,
-        original_waypoints,
-        samples_per_segment=samples_per_segment,
-    )
-    variants = [("cma_original", original_waypoints)]
-    reference_paths = [original_path]
-
-    for regularized_index in range(max(0, CMA_SOLUTIONS_PER_BRANCH - 1)):
-        seed = regularized_seeds[regularized_index]
-        regularized_waypoints = cma_es_refine_waypoints_3d_diverse(
+    """CMA_SOLUTIONS_PER_BRANCH plain CMA-ES refinements of the same warm start,
+    one per seed (planner_seed first, then variant_seeds). No diversity term."""
+    seeds = [planner_seed] + list(variant_seeds)
+    variants = []
+    for index, seed in enumerate(seeds[:CMA_SOLUTIONS_PER_BRANCH]):
+        waypoints = cma_es_refine_waypoints_3d(
             flight_plan_3d,
             mu,
             P,
@@ -829,19 +647,12 @@ def cma_es_refine_waypoint_variants(
             utility_threshold,
             ZMIN,
             ZMAX,
-            reference_paths=reference_paths,
+            predictive_variance=True,
+            maxiter=CMA_GENERATIONS,
+            maxfevals=CMA_MAXFEVALS,
             seed=seed,
         )
-        regularized_path = build_spline_trajectory_3d(
-            cx,
-            cy,
-            cz,
-            regularized_waypoints,
-            samples_per_segment=samples_per_segment,
-        )
-        reference_paths.append(regularized_path)
-        variants.append((f"cma_regularized_{regularized_index + 1}", regularized_waypoints))
-
+        variants.append((f"cma_seed_{index}", waypoints))
     return variants
 
 
@@ -1048,7 +859,7 @@ def simulate_candidate(
     samplestep,
     rng_seed,
     planner_seed,
-    regularized_seeds,
+    variant_seeds,
     forced_first=None,
 ):
     flight_plan_3d = branch_grid_search_3d(
@@ -1077,7 +888,7 @@ def simulate_candidate(
         cz,
         beta,
         planner_seed=planner_seed,
-        regularized_seeds=regularized_seeds,
+        variant_seeds=variant_seeds,
     )
     return [
         execute_refined_candidate(
@@ -1115,12 +926,12 @@ def _simulate_branch_worker(payload):
     (
         branch_idx, forced_first, beta, cx, cy, cz, mu, P, pts, true_map_flat,
         xs, ys, xmin, xmax, ymin, ymax, samplestep, rng_seed, planner_seed,
-        regularized_seeds,
+        variant_seeds,
     ) = payload
     results = simulate_candidate(
         beta, cx, cy, cz, mu, P, pts, true_map_flat, xs, ys, xmin, xmax, ymin, ymax,
         samplestep, rng_seed=rng_seed, planner_seed=planner_seed,
-        regularized_seeds=regularized_seeds, forced_first=forced_first,
+        variant_seeds=variant_seeds, forced_first=forced_first,
     )
     for result in results:
         result["branch_idx"] = branch_idx
@@ -1376,7 +1187,7 @@ def run_chain_and_record(
                     samplestep,
                     rng_seed=make_round_seed(selected_map, start_index, round_idx, branch_idx, purpose=0),
                     planner_seed=make_round_seed(selected_map, start_index, round_idx, branch_idx, purpose=1),
-                    regularized_seeds=[
+                    variant_seeds=[
                         make_round_seed(
                             selected_map,
                             start_index,

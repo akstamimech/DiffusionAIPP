@@ -1,13 +1,15 @@
 """
-Diagnostic: how far apart do the CMA_SOLUTIONS_PER_BRANCH=3 CMA-ES variants
-(original + 2 diversity-regularized) actually land, in practice, at real
-belief states from a real chain - compared against
-CMA_DIVERSITY_DISTANCE_THRESHOLD? Doesn't touch the production collector
-file; duplicates a thin slice of run_chain_and_record's round-advance loop
-so it can call simulate_candidate directly and see ALL 3 variants (not just
-the ones the separate, unrelated variance-based NEIGHBOURHOOD_THRESHOLD
-happens to keep).
+Diagnostic: how different are the CMA_SOLUTIONS_PER_BRANCH plain CMA-ES
+solutions (same warm start, different seeds, NO diversity term) at real belief
+states from a real chain, and how many does the production selection keep?
+Prints per candidate its masked variance reduction relative to the best, per
+pair the xyz RMS distance and the Jaccard distance of the important-cell
+footprints, and how many candidates survive the neighbourhood cut and the
+Jaccard filter. Doesn't touch the production collector file; duplicates a thin
+slice of run_chain_and_record's round-advance loop so it can call
+simulate_candidate directly and see ALL candidates.
 """
+import os
 import sys
 from pathlib import Path
 
@@ -19,13 +21,14 @@ if str(script_dir) not in sys.path:
 
 import DataCollector_3D_randomstart_CMAESregularized as dc
 
-SELECTED_MAP = 91
-ROUNDS = int(__import__("os").environ.get("SMOKETEST_ROUNDS", "5"))
+SELECTED_MAP = int(os.environ.get("SMOKETEST_MAP", "5"))
+ROUNDS = int(os.environ.get("SMOKETEST_ROUNDS", "3"))
 
 
 def pairwise_xyz_rms(path_a, path_b):
-    # same distance the CMA-ES diversity penalty uses (xyz, z-weighted)
-    return float(np.sqrt(dc.trajectory_sq_distance(path_a, path_b)))
+    a = dc.resample_trajectory(path_a, dc.target_trajectory_len)
+    b = dc.resample_trajectory(path_b, dc.target_trajectory_len)
+    return float(np.sqrt(np.mean(np.sum((a - b) ** 2, axis=1))))
 
 
 def main():
@@ -38,8 +41,7 @@ def main():
         enumerate(dc.starts_for_map(SELECTED_MAP, xmin, xmax, ymin, ymax))
     )[0]
 
-    mean_field = np.full(X_test.shape[0], dc.utility_threshold - 0.1, dtype=float)
-    mu = mean_field.copy()
+    mu = np.full(X_test.shape[0], dc.utility_threshold - 0.1, dtype=float)
     P = cov.copy()
     cx, cy, cz = start_cx, start_cy, dc.INIT_ALTITUDE
     samplestep = dc.step
@@ -52,12 +54,9 @@ def main():
         cx, cy, cz, mu, P, true_map_flat, xs, ys, xmin, xmax, ymin, ymax, rng,
         goal_x=warmup_goal_x, goal_y=warmup_goal_y,
     )
-
-    threshold_rms = dc.CMA_DIVERSITY_DISTANCE_THRESHOLD  # what the code effectively enforces as an RMS xy distance
-    mse_threshold = dc.CMA_DIVERSITY_DISTANCE_THRESHOLD ** 2
-    print(f"CMA_DIVERSITY_DISTANCE_THRESHOLD={dc.CMA_DIVERSITY_DISTANCE_THRESHOLD} "
-          f"(mse_threshold={mse_threshold}), CMA_STEP_SIZE_XY={dc.CMA_STEP_SIZE_XY}, "
-          f"CMA_STEP_SIZE_Z={dc.CMA_STEP_SIZE_Z}\n")
+    print(f"CMA_SOLUTIONS_PER_BRANCH={dc.CMA_SOLUTIONS_PER_BRANCH}, CMA_GENERATIONS={dc.CMA_GENERATIONS}, "
+          f"NEIGHBOURHOOD_THRESHOLD={dc.NEIGHBOURHOOD_THRESHOLD}, JACCARD_MIN_DISTANCE={dc.JACCARD_MIN_DISTANCE}, "
+          f"CMA_STEP_SIZE_XY={dc.CMA_STEP_SIZE_XY}, CMA_STEP_SIZE_Z={dc.CMA_STEP_SIZE_Z}\n")
 
     for round_idx in range(ROUNDS):
         branch_idx = 0
@@ -66,14 +65,12 @@ def main():
             samplestep,
             rng_seed=dc.make_round_seed(SELECTED_MAP, start_index, round_idx, branch_idx, purpose=0),
             planner_seed=dc.make_round_seed(SELECTED_MAP, start_index, round_idx, branch_idx, purpose=1),
-            regularized_seeds=[
+            variant_seeds=[
                 dc.make_round_seed(SELECTED_MAP, start_index, round_idx, branch_idx, purpose=2 + i)
                 for i in range(max(0, dc.CMA_SOLUTIONS_PER_BRANCH - 1))
             ],
         )
         paths = [r["spline_path"] for r in results]
-        variants = [r["cma_variant"] for r in results]
-
         utility = dc.importance_filter(mu, P, dc.BETA, threshold=dc.utility_threshold)
         importance_mask = utility > 0
         footprints = [dc.path_footprint(p, xs, ys, importance_mask) for p in paths]
@@ -81,13 +78,11 @@ def main():
         gains = [baseline_var - float(np.sum(np.diag(r["final_P"])[importance_mask])) for r in results]
         best_gain = max(gains)
 
-        print(f"round {round_idx}: gains vs best = " + ", ".join(f"{g / best_gain:.3f}" for g in gains))
+        print(f"round {round_idx}: reduction vs best = " + ", ".join(f"{g / best_gain:.2f}" for g in gains))
         for i in range(len(paths)):
             for j in range(i + 1, len(paths)):
-                rms = pairwise_xyz_rms(paths[i], paths[j])
-                jd = dc.jaccard_distance(footprints[i], footprints[j])
-                cleared = "CLEARS threshold (counts as diverse)" if rms > threshold_rms else "under threshold (penalized as too similar)"
-                print(f"  {variants[i]} vs {variants[j]}: RMS xyz = {rms:6.2f} m ({cleared}), Jaccard = {jd:.3f}")
+                print(f"  seed {i} vs seed {j}: RMS xyz = {pairwise_xyz_rms(paths[i], paths[j]):6.2f} m, "
+                      f"Jaccard = {dc.jaccard_distance(footprints[i], footprints[j]):.3f}")
         winner_i = int(np.argmax(gains))
         near_opt = [i for i, g in enumerate(gains) if i == winner_i or g / best_gain >= dc.NEIGHBOURHOOD_THRESHOLD]
         kept = dc.select_distinct_modes(
@@ -95,14 +90,7 @@ def main():
             near_opt, winner_i, importance_mask, xs, ys,
         )
         print(f"  kept: {len(near_opt)} within {dc.NEIGHBOURHOOD_THRESHOLD:.0%} of best, {len(kept)} after Jaccard >= {dc.JACCARD_MIN_DISTANCE}")
-
-        # advance using the variance-winner, same rule run_chain_and_record uses
-        winner = max(results, key=lambda r: 0)  # placeholder, replaced below
-        # compute masked variance exactly as run_chain_and_record does, to pick the same winner
-        utility = dc.importance_filter(mu, P, dc.BETA, threshold=dc.utility_threshold)
-        importance_mask = utility > 0
-        baseline_variance = float(np.sum(np.diag(P)[importance_mask]))
-        best = max(results, key=lambda r: baseline_variance - float(np.sum(np.diag(r["final_P"])[importance_mask])))
+        best = results[winner_i]
         cx, cy, cz = best["update_cx"], best["update_cy"], best["update_cz"]
         mu, P = best["update_mu"], best["update_P"]
 

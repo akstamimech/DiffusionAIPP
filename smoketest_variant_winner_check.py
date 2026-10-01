@@ -1,12 +1,11 @@
 """
 Diagnostic: across many real rounds of a real chain, which of the
-CMA_SOLUTIONS_PER_BRANCH=3 CMA-ES variants (cma_original, cma_regularized_1,
-cma_regularized_2) actually wins each round - i.e. achieves the highest
-REALIZED masked-variance reduction, the same criterion run_chain_and_record
-uses to pick the winner and to decide which branches are kept as multimodal
-alternates? Does a diversity-regularized variant (found by penalizing
-closeness to earlier solutions in the same round) ever come back better than
-the plain (unregularized) original CMA-ES pass, not just different?
+CMA_SOLUTIONS_PER_BRANCH plain CMA-ES solutions (cma_seed_0, cma_seed_1, ...,
+same warm start, different seeds, no diversity term) actually wins each round -
+i.e. achieves the highest REALIZED masked-variance reduction, the same
+criterion run_chain_and_record uses to pick the winner and to decide which
+branches are kept as multimodal alternates? Is the winner always the same seed
+index (which would point to a systematic effect) or does it vary?
 """
 import sys
 from pathlib import Path
@@ -56,7 +55,7 @@ def main():
             samplestep,
             rng_seed=dc.make_round_seed(SELECTED_MAP, start_index, round_idx, branch_idx, purpose=0),
             planner_seed=dc.make_round_seed(SELECTED_MAP, start_index, round_idx, branch_idx, purpose=1),
-            regularized_seeds=[
+            variant_seeds=[
                 dc.make_round_seed(SELECTED_MAP, start_index, round_idx, branch_idx, purpose=2 + i)
                 for i in range(max(0, dc.CMA_SOLUTIONS_PER_BRANCH - 1))
             ],
