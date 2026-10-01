@@ -88,10 +88,16 @@ except ImportError:
 #     have used to make the choice. RMSE_correction is still computed and
 #     recorded per sample as a diagnostic/eval signal, it just no longer
 #     drives which branches are kept.
-#   - the chain only ever advances using the single best-performing branch
-#     (highest variance_correction) - the other kept branches are extra
-#     recorded labels for the same conditioning state, they don't fork the
-#     chain itself.
+#   - the chain advances along ONE kept mode per round, drawn uniformly at
+#     random from the kept set (CONTINUE_RANDOM_KEPT_MODE=True; False restores
+#     the old behaviour of always following the best branch). All kept modes
+#     are recorded as labels for the same conditioning state, but only the
+#     drawn one forks the chain's future, so cost stays linear. Drawing
+#     uniformly matches what a policy that reproduces the labels does at
+#     inference (it samples among the kept modes), so the states the chain
+#     visits cover the states each mode leads to, not only those reached by
+#     the best mode. Which mode was followed is stored in the "continued"
+#     field of the dataset.
 #   - branches within NEIGHBOURHOOD_THRESHOLD of the best branch's
 #     variance_correction are ALL recorded (not discarded), sharing the same
 #     condition_id/parent_beam_id (identifying them as alternative
@@ -186,6 +192,23 @@ CMA_MAXFEVALS = CMA_GENERATIONS * CMA_PREDICTIVE_POPSIZE * 2  # never the bindin
 # 0.3 rejects only near-duplicates (calibrated on NAIP map 5: about 2% of
 # candidate pairs fall below it; 0.5 rejected about 25%).
 JACCARD_MIN_DISTANCE = float(os.environ.get("JACCARD_MIN_DISTANCE", "0.3"))
+
+# --- which kept mode the chain continues from ---
+# True: draw uniformly from the kept set each round (deterministic per
+# map/start/round via make_round_seed). False: always the best branch.
+CONTINUE_RANDOM_KEPT_MODE = os.environ.get("CONTINUE_RANDOM_KEPT_MODE", "1") == "1"
+CONTINUATION_SEED_PURPOSE = 100  # disjoint from purposes 0 (sensor noise), 1 (planner) and 2.. (variant seeds)
+
+# --- parallel layout / resume ---
+# Every (map, start) chain is an independent task. Tasks are dealt round-robin
+# to ALL MPI ranks, so any number of ranks up to the number of chains stays
+# busy (the old layout split only the STARTS_PER_MAP starts of one map across
+# ranks, leaving ranks beyond that idle, with a sync after every map). Each
+# finished chain is saved as its own chunk file straight away, so a job killed
+# by the time limit keeps everything it finished. COLLECTOR_RESUME=1 makes a
+# re-run skip chains whose chunk already exists (only enable it for re-runs
+# with the same settings and the same chunk directory).
+COLLECTOR_RESUME = os.environ.get("COLLECTOR_RESUME", "0") == "1"
 
 # --- random-start configuration ---
 STARTS_PER_MAP = 4
@@ -291,6 +314,7 @@ def make_empty_dataset():
         "initial_heading_velocity": [],
         "start_position": [],
         "start_index": [],
+        "continued": [],
     }
 
 
@@ -341,6 +365,9 @@ def tensorize_dataset(dataset):
         "start_index": torch.tensor(
             np.asarray(dataset["start_index"], dtype=np.int64)
         ),
+        "continued": torch.tensor(
+            np.asarray(dataset["continued"], dtype=np.int64)
+        ),
     }
 
 
@@ -348,10 +375,20 @@ def dataset_size(dataset):
     return len(dataset["trajectories"])
 
 
-def save_dataset_chunk(dataset, selected_map):
+def chain_chunk_path(selected_map, start_index=None):
+    if start_index is None:
+        return chunk_dir / f"map_{selected_map:03d}_ranked_3d.pt"
+    return chunk_dir / f"map_{selected_map:03d}_start_{start_index:02d}_ranked_3d.pt"
+
+
+def save_dataset_chunk(dataset, selected_map, start_index=None):
     chunk_dir.mkdir(parents=True, exist_ok=True)
-    chunk_path = chunk_dir / f"map_{selected_map:03d}_ranked_3d.pt"
-    torch.save(tensorize_dataset(dataset), chunk_path)
+    chunk_path = chain_chunk_path(selected_map, start_index)
+    # write to a temp name first so a job killed mid-write never leaves a
+    # truncated chunk that a resumed run would mistake for a finished chain
+    tmp_path = chunk_path.with_suffix(".tmp")
+    torch.save(tensorize_dataset(dataset), tmp_path)
+    os.replace(tmp_path, chunk_path)
     print(f"Saved chunk {chunk_path} with {dataset_size(dataset)} samples")
     return chunk_path
 
@@ -971,6 +1008,7 @@ def record_candidate(
     dataset["initial_heading_velocity"].append(initial_heading_velocity.astype(np.float32))
     dataset["start_position"].append(np.asarray(start_position, dtype=np.float32))
     dataset["start_index"].append(start_index)
+    dataset["continued"].append(int(candidate.get("continued", 0)))
 
 
 def load_map(selected_map):
@@ -1232,9 +1270,20 @@ def run_chain_and_record(
         )
         group_id = condition_id_for(selected_map, start_index, round_idx)
 
+        # ordered_kept[0] is the winner (best branch). The chain continues from
+        # either the winner or, by default, a uniformly drawn kept mode.
+        if CONTINUE_RANDOM_KEPT_MODE and len(ordered_kept) > 1:
+            continuation_rng = np.random.default_rng(
+                make_round_seed(selected_map, start_index, round_idx, 0, purpose=CONTINUATION_SEED_PURPOSE)
+            )
+            continue_idx = ordered_kept[int(continuation_rng.integers(len(ordered_kept)))]
+        else:
+            continue_idx = winner_idx
+
         for parent_beam_index, branch_i in enumerate(ordered_kept):
             branch_candidate = branch_results[branch_i]
             branch_candidate["condition_id"] = group_id
+            branch_candidate["continued"] = int(branch_i == continue_idx)
             record_candidate(
                 local_dataset,
                 branch_candidate,
@@ -1249,20 +1298,93 @@ def run_chain_and_record(
             )
 
         winner = branch_results[winner_idx]
+        continued = branch_results[continue_idx]
         print(
             f"[MPI {mpi_rank}/{mpi_size}] Map {selected_map}, start {start_index}, "
             f"round {round_idx}: masked variance {baseline_variance:.4f} -> "
-            f"{baseline_variance - winner['variance_correction']:.4f} "
-            f"(reduction={winner['variance_correction']:.4f}), global RMSE "
-            f"{baseline_rmse:.4f} -> {winner['global_rmse']:.4f} "
+            f"{baseline_variance - continued['variance_correction']:.4f} "
+            f"(reduction={continued['variance_correction']:.4f}, best={winner['variance_correction']:.4f}, "
+            f"continued mode {ordered_kept.index(continue_idx)} of {len(ordered_kept)}), global RMSE "
+            f"{baseline_rmse:.4f} -> {continued['global_rmse']:.4f} "
             f"({len(ordered_kept)}/{len(branch_results)} CMA-ES variants kept: "
             f"{len(kept_indices)} within {round(NEIGHBOURHOOD_THRESHOLD * 100)}% of best "
             f"masked variance reduction, {len(ordered_kept)} after Jaccard "
             f">= {JACCARD_MIN_DISTANCE})"
         )
 
-        cx, cy, cz = winner["update_cx"], winner["update_cy"], winner["update_cz"]
-        mu, P = winner["update_mu"], winner["update_P"]
+        cx, cy, cz = continued["update_cx"], continued["update_cy"], continued["update_cz"]
+        mu, P = continued["update_mu"], continued["update_P"]
+
+
+def build_chain_tasks(xmin, xmax, ymin, ymax):
+    """Every (map, start) chain of the collection, map-major, in a fixed order."""
+    tasks = []
+    for selected_map in range(initial_map, initial_map + mapcount):
+        for start_index, (start_cx, start_cy) in enumerate(
+            starts_for_map(selected_map, xmin, xmax, ymin, ymax)
+        ):
+            tasks.append((selected_map, start_index, start_cx, start_cy))
+    return tasks
+
+
+def run_rank_tasks(mpi_rank, mpi_size, pool=None):
+    """Run this rank's share of the chains; returns the chunk paths it produced
+    (or found already finished when COLLECTOR_RESUME is on)."""
+    _, X_test, mean, cov, xs, ys, X, Y, xmin, xmax, ymin, ymax, _ = initialize_gp(
+        sigma2=GP_KERNEL_SIGMA2,
+        lengthscale=GP_KERNEL_LENGTHSCALE,
+    )
+    tasks = build_chain_tasks(xmin, xmax, ymin, ymax)
+    my_tasks = assigned_tasks_for_rank(tasks, mpi_rank, mpi_size)
+    if mpi_rank == 0:
+        print(
+            f"{len(tasks)} chains ({mapcount} maps x {STARTS_PER_MAP} starts) over {mpi_size} ranks: "
+            f"{min(len(tasks), mpi_size)} ranks busy, up to {-(-len(tasks) // mpi_size)} chains per rank",
+            flush=True,
+        )
+
+    chunk_paths = []
+    loaded_map = None
+    for task_number, (selected_map, start_index, start_cx, start_cy) in enumerate(my_tasks, start=1):
+        chunk_path = chain_chunk_path(selected_map, start_index)
+        if COLLECTOR_RESUME and chunk_path.exists():
+            print(f"[MPI {mpi_rank}/{mpi_size}] Map {selected_map}, start {start_index}: chunk exists, skipping (resume)", flush=True)
+            chunk_paths.append(chunk_path)
+            continue
+        if loaded_map != selected_map:
+            pts = load_map(selected_map)
+            true_map_flat = build_true_map_flat(pts, X_test)
+            loaded_map = selected_map
+        print(
+            f"[MPI {mpi_rank}/{mpi_size}] Map {selected_map}, start {start_index}: "
+            f"({start_cx:.1f}, {start_cy:.1f}) [chain {task_number} of {len(my_tasks)} on this rank]",
+            flush=True,
+        )
+        local_dataset = make_empty_dataset()
+        run_chain_and_record(
+            local_dataset,
+            selected_map,
+            start_index,
+            start_cx,
+            start_cy,
+            pts,
+            true_map_flat,
+            xs,
+            ys,
+            X,
+            xmin,
+            xmax,
+            ymin,
+            ymax,
+            X_test,
+            cov,
+            mpi_rank,
+            mpi_size,
+            pool=pool,
+        )
+        chunk_paths.append(save_dataset_chunk(local_dataset, selected_map, start_index))
+        del local_dataset
+    return chunk_paths
 
 
 def main():
@@ -1276,7 +1398,6 @@ def main():
             "`mpiexec -n $SLURM_NTASKS python DataCollector_3D_randomstart_multimodal.py`."
         )
 
-    chunk_paths = []
     if mpi_rank == 0:
         print(
             f"Running 3D multimodal-branching linear-chain collection with "
@@ -1284,7 +1405,10 @@ def main():
             f"NEIGHBOURHOOD_THRESHOLD={NEIGHBOURHOOD_THRESHOLD}, "
             f"PARALLEL_BRANCHES={PARALLEL_BRANCHES}, RANKLIM={RANKLIM}, "
             f"EXECUTION_CHUNK_SCORING={EXECUTION_CHUNK_SCORING}, "
-            f"EXECUTION_CHUNK_UPDATING={EXECUTION_CHUNK_UPDATING}"
+            f"EXECUTION_CHUNK_UPDATING={EXECUTION_CHUNK_UPDATING}, "
+            f"CMA_GENERATIONS={CMA_GENERATIONS}, JACCARD_MIN_DISTANCE={JACCARD_MIN_DISTANCE}, "
+            f"COLLECTOR_RESUME={COLLECTOR_RESUME}",
+            flush=True,
         )
 
     # One pool per rank, created once and reused for every chain/round that
@@ -1293,68 +1417,19 @@ def main():
     pool = ProcessPoolExecutor(max_workers=BRANCH_COUNT) if PARALLEL_BRANCHES else None
 
     try:
-        for selected_map in range(initial_map, initial_map + mapcount):
-            if mpi_rank == 0:
-                print(f"\nCollecting 3D CMA-ES multimodal rollout data for map {selected_map}")
-
-            pts = load_map(selected_map)
-            _, X_test, mean, cov, xs, ys, X, Y, xmin, xmax, ymin, ymax, _ = initialize_gp(
-                sigma2=GP_KERNEL_SIGMA2,
-                lengthscale=GP_KERNEL_LENGTHSCALE,
-            )
-            true_map_flat = build_true_map_flat(pts, X_test)
-
-            map_starts = list(enumerate(starts_for_map(selected_map, xmin, xmax, ymin, ymax)))
-            local_starts = assigned_tasks_for_rank(map_starts, mpi_rank, mpi_size)
-
-            local_dataset = make_empty_dataset()
-            for start_index, (start_cx, start_cy) in local_starts:
-                print(
-                    f"[MPI {mpi_rank}/{mpi_size}] Map {selected_map}, start {start_index}: "
-                    f"({start_cx:.1f}, {start_cy:.1f})"
-                )
-                run_chain_and_record(
-                    local_dataset,
-                    selected_map,
-                    start_index,
-                    start_cx,
-                    start_cy,
-                    pts,
-                    true_map_flat,
-                    xs,
-                    ys,
-                    X,
-                    xmin,
-                    xmax,
-                    ymin,
-                    ymax,
-                    X_test,
-                    cov,
-                    mpi_rank,
-                    mpi_size,
-                    pool=pool,
-                )
-
-            if comm is None:
-                gathered_datasets = [local_dataset]
-            else:
-                gathered_datasets = comm.gather(local_dataset, root=0)
-
-            if mpi_rank == 0:
-                map_dataset = make_empty_dataset()
-                for partial in gathered_datasets:
-                    for key in map_dataset:
-                        map_dataset[key].extend(partial[key])
-                chunk_paths.append(save_dataset_chunk(map_dataset, selected_map))
-                del map_dataset
-
-            del pts, X_test, mean, cov, xs, ys, X, Y, true_map_flat, local_dataset
+        local_chunk_paths = run_rank_tasks(mpi_rank, mpi_size, pool=pool)
     finally:
         if pool is not None:
             pool.shutdown(wait=True)
 
+    if comm is None:
+        all_chunk_paths = local_chunk_paths
+    else:
+        gathered = comm.gather(local_chunk_paths, root=0)
+        all_chunk_paths = [path for paths in gathered for path in paths] if mpi_rank == 0 else []
+
     if mpi_rank == 0:
-        consolidate_chunks(chunk_paths, final_dataset_path, delete_chunks=True)
+        consolidate_chunks(sorted(all_chunk_paths), final_dataset_path, delete_chunks=True)
 
 
 if __name__ == "__main__":
