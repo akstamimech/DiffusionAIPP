@@ -6,6 +6,7 @@ __pycache__/
 checkpoints/
 *.pth
 *.pt
+!/dataset_grf_60.pt
 *.log
 *_viz/
 *_chunks/
